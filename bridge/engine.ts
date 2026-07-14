@@ -186,16 +186,12 @@ export class Engine implements PeerHandlers {
 
     let ok = false
     let result = 'cancelled'
-    let costUsd: number | undefined
-    let durationMs = 0
     try {
       const { handle, done } = this.runner.run(task, ctx)
       this.running.handle = handle
       const res = await done
       ok = res.ok
       result = res.result
-      costUsd = res.costUsd
-      durationMs = res.durationMs
     } catch (e) {
       ok = false
       result = (e as Error).message || 'failed'
@@ -212,8 +208,9 @@ export class Engine implements PeerHandlers {
     if (wasCancelled) {
       // the cancel path already sent a "cancelled" note
     } else if (ok) {
-      const foot = `— ${shortModel(task.model)} · ${fmtDur(durationMs)}${costUsd ? ` · $${costUsd.toFixed(2)}` : ''}`
-      this.peer.sendText(`✅ ${result}\n${foot}`)
+      // Just the result — no model/duration/cost footer (that's plumbing, not
+      // conversation; the model already shows in the pill).
+      this.peer.sendText(`✅ ${result}`)
     } else {
       this.peer.sendText(`❌ ${result}`)
     }
@@ -401,10 +398,3 @@ function renderQuestions(questions: AgentQuestion[]): string {
   return ['I have a few questions:', '', ...blocks, '', 'Answer in order, or type freely.'].join('\n')
 }
 
-function fmtDur(ms: number): string {
-  const s = Math.round(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  const r = s % 60
-  return r ? `${m}m ${r}s` : `${m}m`
-}
