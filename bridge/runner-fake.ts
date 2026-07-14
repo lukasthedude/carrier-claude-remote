@@ -14,12 +14,19 @@ import type { Task } from './state'
 export class FakeRunner implements ClaudeRunner {
   run(task: Task, ctx: RunContext): { handle: RunHandle; done: Promise<RunResult> } {
     let cancelled = false
-    const handle: RunHandle = { interrupt: () => { cancelled = true } }
-    const done = this.exec(task, ctx, () => cancelled)
+    let steered: string | null = null
+    const handle: RunHandle = {
+      interrupt: () => { cancelled = true },
+      // steering a fake sleep finishes it immediately with the injected text —
+      // deterministic proof the live run consumed the steer
+      steer: (text: string) => { steered = text },
+      setMode: () => {},
+    }
+    const done = this.exec(task, ctx, () => cancelled, () => steered)
     return { handle, done }
   }
 
-  private async exec(task: Task, ctx: RunContext, isCancelled: () => boolean): Promise<RunResult> {
+  private async exec(task: Task, ctx: RunContext, isCancelled: () => boolean, getSteer: () => string | null): Promise<RunResult> {
     const t0 = Date.now()
     const fin = (ok: boolean, result: string): RunResult => ({ ok, result, costUsd: 0, durationMs: Date.now() - t0 })
     ctx.onSessionId(`fake-session-${task.project || 'default'}`)
@@ -46,6 +53,8 @@ export class FakeRunner implements ClaudeRunner {
       const start = Date.now()
       while (Date.now() - start < ms) {
         if (isCancelled()) return fin(false, 'cancelled')
+        const s = getSteer()
+        if (s !== null) return fin(true, `steered: ${s}`)
         await new Promise((r) => setTimeout(r, 25))
       }
       return fin(true, `slept ${ms}`)

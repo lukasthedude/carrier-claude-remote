@@ -35,7 +35,7 @@ export interface PeerOpts {
 export interface PeerHandlers {
   // agent role
   onOwnerMessage?(text: string, msgId: string): void
-  onCtl?(ctl: { model?: string; cancel?: string; sync?: true; ts: number }): void
+  onCtl?(ctl: { model?: string; cancel?: string; sync?: true; mode?: string; effort?: string; move?: { id: string; to: number }; steer?: string; ts: number }): void
   onOwnerConnected?(): void
   // host role
   onSpawn?(spawn: { project: string; branch?: string; attach?: string }): void
@@ -126,6 +126,10 @@ export class CarrierPeer {
           ...(inner.model ? { model: inner.model } : {}),
           ...(inner.cancel ? { cancel: inner.cancel } : {}),
           ...(inner.sync ? { sync: true } : {}),
+          ...(inner.mode ? { mode: inner.mode } : {}),
+          ...(inner.effort ? { effort: inner.effort } : {}),
+          ...(inner.move ? { move: inner.move } : {}),
+          ...(inner.steer ? { steer: inner.steer } : {}),
         })
         return
       case 'a-spawn':
@@ -159,7 +163,7 @@ export class CarrierPeer {
     return firstId
   }
 
-  sendStatus(status: { state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[] }): void {
+  sendStatus(status: { state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[]; mode?: string; effort?: string }): void {
     if (!this.ownerPk) return
     this.sendInner(this.ownerPk, {
       kind: 'a-status',

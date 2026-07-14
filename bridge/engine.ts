@@ -8,7 +8,7 @@ import { projectCwd, type BridgeConfig } from './config'
 import { HELP_TEXT, parseCommand } from './commands'
 import { classifyTool } from './policy'
 import type { AgentQuestion, CarrierPeer, PeerHandlers } from './peer'
-import type { ClaudeRunner, RunContext } from './runner'
+import type { ClaudeRunner, RunContext, RunHandle } from './runner'
 import { taskTitle, type EngineState, type Task } from './state'
 
 const TYPING_PULSE_MS = 4000
@@ -24,12 +24,14 @@ interface PendingAsk {
 
 interface Running {
   task: Task
-  handle: { interrupt(): void } | null
+  handle: RunHandle | null
 }
 
 export class Engine implements PeerHandlers {
   private currentModel: string
   private currentProject: string
+  private currentMode: string
+  private currentEffort: string | undefined
   private running: Running | null = null
   private pendingAsk: PendingAsk | null = null
   private typingTimer: ReturnType<typeof setInterval> | null = null
@@ -43,6 +45,8 @@ export class Engine implements PeerHandlers {
   ) {
     this.currentModel = config.model
     this.currentProject = config.defaultProject
+    this.currentMode = state.mode ?? config.permissionMode
+    this.currentEffort = state.effort
     this.recoverOnBoot()
   }
 
@@ -114,9 +118,14 @@ export class Engine implements PeerHandlers {
     }
   }
 
-  onCtl(ctl: { model?: string; cancel?: string; sync?: true; ts: number }): void {
+  onCtl(ctl: { model?: string; cancel?: string; sync?: true; mode?: string; effort?: string; move?: { id: string; to: number }; steer?: string; ts: number }): void {
     if (ctl.model) this.handleModel(ctl.model, true) // last-writer-wins; safe to apply anytime
-    // A mailbox-stale cancel must not kill a task queued after it was sent.
+    if (ctl.mode) this.handleMode(ctl.mode)
+    if (ctl.effort) this.handleEffort(ctl.effort)
+    if (ctl.move) this.moveTask(ctl.move)
+    // Stale-guard the destructive/one-shot verbs the same way as cancel: a
+    // mailbox-delayed steer must not hijack a task queued long after it.
+    if (ctl.steer && Date.now() - ctl.ts <= CTL_STALE_MS) this.steer(ctl.steer)
     if (ctl.cancel && Date.now() - ctl.ts <= CTL_STALE_MS) this.cancel(ctl.cancel)
     if (ctl.sync) this.emitStatus()
   }
@@ -165,7 +174,8 @@ export class Engine implements PeerHandlers {
     const ctx: RunContext = {
       cwd,
       model: task.model,
-      permissionMode: this.config.permissionMode,
+      permissionMode: this.currentMode,
+      ...(this.currentEffort ? { effort: this.currentEffort } : {}),
       progress: this.config.progress,
       ...(this.state.session(task.project) ? { resumeSessionId: this.state.session(task.project) } : {}),
       onSessionId: (id) => this.state.setSession(task.project, id),
@@ -270,6 +280,57 @@ export class Engine implements PeerHandlers {
     this.emitStatus()
   }
 
+  /** Switch the permission mode ('default' ↔ 'plan') — applies to the running
+   *  task live (SDK setPermissionMode) AND to everything after; persisted. */
+  private handleMode(mode: string): void {
+    if (mode !== 'default' && mode !== 'plan' && mode !== 'acceptEdits') return // loose but bounded
+    if (mode === this.currentMode) return
+    this.currentMode = mode
+    this.state.setPrefs({ mode })
+    this.running?.handle?.setMode?.(mode)
+    this.emitStatus()
+  }
+
+  /** Set the reasoning effort — applies from the next task (a query option). */
+  private handleEffort(effort: string): void {
+    if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) return
+    if (effort === this.currentEffort) return
+    this.currentEffort = effort
+    this.state.setPrefs({ effort })
+    this.emitStatus()
+  }
+
+  /** Reorder a QUEUED task to index `to` among the queued (running/waiting
+   *  tasks keep their place at the front). */
+  private moveTask(move: { id: string; to: number }): void {
+    const queued = this.state.queue.filter((t) => t.state === 'queued')
+    const others = this.state.queue.filter((t) => t.state !== 'queued')
+    const from = queued.findIndex((t) => t.id === move.id)
+    if (from < 0) return
+    const [task] = queued.splice(from, 1)
+    queued.splice(Math.max(0, Math.min(move.to, queued.length)), 0, task!)
+    this.state.queue = [...others, ...queued]
+    this.state.saveQueue()
+    this.emitStatus()
+  }
+
+  /** Promote a queued task into the LIVE run: its text is injected into the
+   *  running conversation as the next turn (Conductor-style steering). With
+   *  nothing running (or a runner that can't steer) it degrades to run-next. */
+  private steer(id: string): void {
+    const task = this.state.queue.find((t) => t.id === id && t.state === 'queued')
+    if (!task) return
+    if (this.running && this.running.handle?.steer && (this.running.task.state as string) !== 'cancelled') {
+      this.state.queue = this.state.queue.filter((t) => t.id !== id)
+      this.state.saveQueue()
+      this.running.handle.steer(task.text)
+      this.peer.sendText(`↪️ Steering the current task: “${task.title}”`)
+      this.emitStatus()
+      return
+    }
+    this.moveTask({ id, to: 0 }) // nothing live to steer — make it next instead
+  }
+
   private handleProject(name: string | undefined): void {
     const names = Object.keys(this.config.projects)
     if (!name) {
@@ -294,7 +355,7 @@ export class Engine implements PeerHandlers {
       .filter((t) => t.state === 'queued' || t.state === 'running' || t.state === 'waiting')
       .map((t) => ({ id: t.id, title: t.title, state: t.state }))
     const state = this.running ? (this.running.task.state === 'waiting' ? 'waiting' : 'busy') : 'idle'
-    this.peer.sendStatus({ state, model: this.currentModel, models: this.config.models, queue })
+    this.peer.sendStatus({ state, model: this.currentModel, models: this.config.models, queue, mode: this.currentMode, ...(this.currentEffort ? { effort: this.currentEffort } : {}) })
   }
 
   private startTyping(): void {

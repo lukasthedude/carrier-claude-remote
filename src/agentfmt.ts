@@ -67,13 +67,21 @@ export function hasCode(text: string): boolean {
 }
 
 /**
- * A compact model label for the chat header/picker: 'claude-sonnet-4-5' →
- * 'sonnet-4-5', dropping the 'claude-' prefix and any trailing release date.
- * Aliases ('sonnet', 'opus', 'haiku') pass through unchanged.
+ * A friendly model label for the chat header/picker, the way Anthropic writes
+ * them: 'claude-fable-5' → 'Fable 5', 'claude-opus-4-8' → 'Opus 4.8',
+ * 'claude-sonnet-4-5-20250929' → 'Sonnet 4.5'. Bare aliases title-case
+ * ('opus' → 'Opus'); anything unrecognized falls back to the trimmed id.
  */
 export function shortModel(id: string): string {
   let s = id.trim()
+  if (!s) return id
   if (s.startsWith('claude-')) s = s.slice('claude-'.length)
   s = s.replace(/-\d{8}$/, '') // drop a trailing -YYYYMMDD snapshot date
-  return s || id
+  const parts = s.split('-')
+  const family = parts[0] ?? ''
+  if (!/^[a-zA-Z]+$/.test(family)) return s || id
+  const version = parts.slice(1).join('.')
+  if (version && !/^\d+(\.\d+)*$/.test(version)) return s || id // e.g. '3-5-sonnet' — leave as-is
+  const name = family[0]!.toUpperCase() + family.slice(1)
+  return version ? `${name} ${version}` : name
 }

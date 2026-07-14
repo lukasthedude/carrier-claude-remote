@@ -27,6 +27,17 @@ const SYSTEM_APPEND = [
 export class SdkRunner implements ClaudeRunner {
   run(task: Task, ctx: RunContext): { handle: RunHandle; done: Promise<RunResult> } {
     let query: Any = null
+    // Steerable input: the stream stays open, and steer() pushes another owner
+    // message into the live conversation (processed as the next turn).
+    const pending: Any[] = [{ type: 'user', message: { role: 'user', content: task.text } }]
+    let pushed = 1
+    let wake: (() => void) | null = null
+    const push = (m: Any) => {
+      pending.push(m)
+      pushed++
+      wake?.()
+      wake = null
+    }
     const handle: RunHandle = {
       interrupt: () => {
         try {
@@ -35,14 +46,29 @@ export class SdkRunner implements ClaudeRunner {
           /* already gone */
         }
       },
+      steer: (text: string) => push({ type: 'user', message: { role: 'user', content: text } }),
+      setMode: (mode: string) => {
+        try {
+          query?.setPermissionMode?.(mode)
+        } catch {
+          /* not live yet / already done — the next task picks it up anyway */
+        }
+      },
     }
-    const done = this.exec(task, ctx, (q) => { query = q }).catch(
+    const done = this.exec(task, ctx, pending, () => pushed, (r) => (wake = r), (q) => { query = q }).catch(
       (e): RunResult => ({ ok: false, result: `Runner error: ${(e as Error).message}`, durationMs: 0 }),
     )
     return { handle, done }
   }
 
-  private async exec(task: Task, ctx: RunContext, setQuery: (q: Any) => void): Promise<RunResult> {
+  private async exec(
+    task: Task,
+    ctx: RunContext,
+    pending: Any[],
+    pushedCount: () => number,
+    onIdle: (wake: () => void) => void,
+    setQuery: (q: Any) => void,
+  ): Promise<RunResult> {
     const t0 = Date.now()
     let sdk: Any
     try {
@@ -51,17 +77,20 @@ export class SdkRunner implements ClaudeRunner {
       return { ok: false, result: `Claude Agent SDK not installed. On the Mac run:  npm i ${SDK_SPECIFIER}`, durationMs: Date.now() - t0 }
     }
 
-    // Streaming-input mode (a generator that yields one turn then stays open) is
-    // required for interrupt() and permission round-trips.
+    // Streaming-input mode (a generator that stays open) is required for
+    // interrupt(), permission round-trips, and mid-run steering.
     async function* prompt(): AsyncGenerator<Any> {
-      yield { type: 'user', message: { role: 'user', content: task.text } }
-      await new Promise<void>(() => {}) // hold the input stream open until we stop it
+      for (;;) {
+        while (pending.length) yield pending.shift()
+        await new Promise<void>((r) => onIdle(r))
+      }
     }
 
     const options: Any = {
       cwd: ctx.cwd,
       model: ctx.model,
       permissionMode: ctx.permissionMode,
+      ...(ctx.effort ? { effort: ctx.effort } : {}),
       ...(ctx.resumeSessionId ? { resume: ctx.resumeSessionId } : {}),
       systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_APPEND },
       canUseTool: async (toolName: string, input: Record<string, unknown>) => {
@@ -92,6 +121,7 @@ export class SdkRunner implements ClaudeRunner {
     let result = ''
     let costUsd: number | undefined
     let ok = true
+    let results = 0
     try {
       for await (const msg of query as AsyncIterable<Any>) {
         if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) ctx.onSessionId(String(msg.session_id))
@@ -99,10 +129,13 @@ export class SdkRunner implements ClaudeRunner {
           const text = extractText(msg)
           if (text) ctx.onProgress(text)
         } else if (msg.type === 'result') {
+          // One result per user turn — a steer pushes another turn, so only
+          // finish once every pushed message has its result (the last one wins).
+          results++
           result = typeof msg.result === 'string' ? msg.result : ''
-          if (typeof msg.total_cost_usd === 'number') costUsd = msg.total_cost_usd
+          if (typeof msg.total_cost_usd === 'number') costUsd = (costUsd ?? 0) + msg.total_cost_usd
           ok = !msg.is_error
-          break
+          if (results >= pushedCount()) break
         }
       }
     } finally {

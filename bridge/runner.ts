@@ -16,6 +16,8 @@ export interface RunContext {
   cwd: string
   model: string
   permissionMode: string
+  /** reasoning effort ('low'…'max'); omitted = the SDK's model default */
+  effort?: string
   progress: 'all' | 'final'
   resumeSessionId?: string
   /** the Claude session id, once known — persisted for conversational resume */
@@ -37,6 +39,11 @@ export interface RunResult {
 
 export interface RunHandle {
   interrupt(): void
+  /** inject another owner message into the LIVE run (steering); optional —
+   *  the engine falls back to run-next when a runner can't steer */
+  steer?(text: string): void
+  /** switch the permission mode of the LIVE run (e.g. plan → default) */
+  setMode?(mode: string): void
 }
 
 export interface ClaudeRunner {

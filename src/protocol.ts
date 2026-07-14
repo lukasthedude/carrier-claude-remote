@@ -23,8 +23,14 @@ export const MAX_HIST_ENTRIES = 12
 /** Longest text one backfilled transcript entry keeps. */
 export const MAX_HIST_TEXT = 2500
 const MAX_FRAME = 65_536
+// A v2 (ratcheted) frame carries a plaintext DR header + length-padded, AEAD'd
+// payload, so it runs larger than v1 for the same content. The relay accepts
+// 200 KB; this cap only bounds JSON.parse before we know the version.
+const MAX_FRAME_V2 = 131_072
+const MAX_MSG_NUM = 0xffff_ffff // u32 ceiling for a DR message/previous-chain number
 const FID_BYTES = 16
 const GID_BYTES = 16 // a group id is 16 random bytes (22 b64u chars) — never collides with a 32-byte pk
+const SID_BYTES = 16 // a Double Ratchet session id (see ratchet.ts)
 const BIN_HEADER = FID_BYTES + 4 + NONCE_BYTES
 
 /** Plaintext content of a frame — everything here is invisible on the wire. */
@@ -38,6 +44,7 @@ export type Inner =
   | { kind: 'msg'; id: string; ts: number; text: string; replyTo?: string }
   | { kind: 'edit'; id: string; ts: number; text: string } // edit a prior msg's text (ts = edit time)
   | { kind: 'del'; id: string } // tombstone a prior msg (both sides drop its content)
+  | { kind: 'react'; id: string; emoji: string } // my reaction on any msg (mine or theirs); '' = remove
   | { kind: 'ack'; ids: string[] }
   | { kind: 'read'; ids: string[] }
   | { kind: 'typing'; on: boolean }
@@ -50,6 +57,14 @@ export type Inner =
   // Silent tombstone: the sender deleted their account. Mailboxed so an offline
   // contact still gets it; never pushed (it must not feel like a new message).
   | { kind: 'gone' }
+  // --- Double Ratchet handshake (forward secrecy) -----------------------------
+  // These three ride the ordinary v1 crypto_box channel (so they bootstrap a
+  // session and are readable by any DR-capable build); actual messages then
+  // move to the v2 envelope. `sid` = 16-byte session id; `eph`/`rpk` = 32-byte
+  // X25519 pubs. Additive — a build without DR drops them as unknown kinds.
+  | { kind: 'dr-init'; sid: string; eph: string; rpk: string }
+  | { kind: 'dr-ack'; sid: string }
+  | { kind: 'dr-reset'; sid: string }
   // --- group chat (client-side fan-out) ---------------------------------------
   // Every group frame is an ordinary pairwise-sealed message that carries the
   // group id, member set, and sender INSIDE the ciphertext, so the relay only
@@ -58,6 +73,7 @@ export type Inner =
   | { kind: 'gmsg'; gid: string; sender: string; id: string; ts: number; text: string; replyTo?: string }
   | { kind: 'gedit'; gid: string; sender: string; id: string; ts: number; text: string }
   | { kind: 'gdel'; gid: string; sender: string; id: string }
+  | { kind: 'greact'; gid: string; sender: string; id: string; emoji: string } // '' = remove
   | { kind: 'gfile-meta'; gid: string; sender: string; id: string; ts: number; fid: string; name: string; mime: string; size: number; chunks: number }
   | { kind: 'gack'; gid: string; ids: string[] }
   | { kind: 'gread'; gid: string; ids: string[] }
@@ -94,11 +110,15 @@ export type Inner =
   //
   // `a-status` (bridge→owner, volatile like typing): a live snapshot of the
   // agent — current state, model, the model menu, and the task queue.
-  // `project`/`branch` (optional) name the worktree this agent runs in.
-  | { kind: 'a-status'; ts: number; state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[]; project?: string; branch?: string }
-  // `a-ctl` (owner→bridge): switch the model, cancel a task (id or 'all'), or ask
-  // for a fresh status. `ts` lets the bridge ignore a mailbox-stale cancel.
-  | { kind: 'a-ctl'; ts: number; model?: string; cancel?: string; sync?: true }
+  // `project`/`branch` (optional) name the worktree this agent runs in;
+  // `mode` = permission mode ('default'|'plan'|…), `effort` = reasoning effort.
+  | { kind: 'a-status'; ts: number; state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[]; project?: string; branch?: string; mode?: string; effort?: string }
+  // `a-ctl` (owner→bridge): switch the model / permission mode / reasoning
+  // effort, cancel a task (id or 'all'), reorder a queued task (`move` it to
+  // index `to` among the queued), promote a queued task into the RUNNING one
+  // (`steer` — its text is injected into the live turn), or ask for a fresh
+  // status. `ts` lets the bridge ignore a mailbox-stale cancel.
+  | { kind: 'a-ctl'; ts: number; model?: string; cancel?: string; sync?: true; mode?: string; effort?: string; move?: { id: string; to: number }; steer?: string }
   // `a-ask` (bridge→owner): a structured question that upgrades the plain
   // numbered-options `msg` (which carries the push) into tappable option chips.
   // `msgId` ties it to that companion message; the owner answers with a `msg`.
@@ -122,19 +142,33 @@ export type Inner =
 /** Most inclusive [start, end] ranges one file-req may carry. */
 export const MAX_REQ_RANGES = 256
 
-/** JSON frame: {v:1, n:<b64u nonce>, c:<b64u crypto_box ciphertext>} */
-export function encodeFrame(inner: Inner, theirPk: Uint8Array, mySk: Uint8Array): string {
-  const { nonce, cipher } = seal(utf8Encode(JSON.stringify(inner)), theirPk, mySk)
-  return JSON.stringify({ v: 1, n: toB64u(nonce), c: toB64u(cipher) })
+/** Inner → wire bytes (the plaintext that a v1 seal or v2 ratchet encrypts). */
+export function serializeInner(inner: Inner): Uint8Array {
+  return utf8Encode(JSON.stringify(inner))
 }
 
-/**
- * Returns the decrypted inner message, or null for a valid frame of an
- * unknown kind (forward compatibility: drop, don't crash).
- * Throws ProtocolError/CryptoError on anything malformed or forged.
- */
-export function decodeFrame(rawText: string, theirPk: Uint8Array, mySk: Uint8Array): Inner | null {
-  if (rawText.length > MAX_FRAME) throw new ProtocolError('frame too large')
+/** Decrypted plaintext bytes → validated Inner (or null for an unknown kind).
+ *  Throws ProtocolError on malformed JSON/shape. Used by both transports after
+ *  their respective decryption (v1 crypto_box open, v2 ratchet decrypt+unpad). */
+export function parseInner(plain: Uint8Array): Inner | null {
+  let raw: unknown
+  try {
+    raw = JSON.parse(utf8Decode(plain))
+  } catch {
+    throw new ProtocolError('inner payload is not JSON')
+  }
+  return validateInner(raw)
+}
+
+/** A wire envelope, parsed WITHOUT any key — so the receiver can read the frame
+ *  version and (for v2) the session id + DR header before deciding how to open
+ *  it. Throws ProtocolError on anything malformed or an unknown version. */
+export type ParsedEnvelope =
+  | { v: 1; nonce: Uint8Array; cipher: Uint8Array }
+  | { v: 2; sid: Uint8Array; rpk: Uint8Array; pn: number; n: number; cipher: Uint8Array }
+
+export function parseEnvelope(rawText: string): ParsedEnvelope {
+  if (rawText.length > MAX_FRAME_V2) throw new ProtocolError('frame too large')
   let envelope: unknown
   try {
     envelope = JSON.parse(rawText)
@@ -143,19 +177,53 @@ export function decodeFrame(rawText: string, theirPk: Uint8Array, mySk: Uint8Arr
   }
   if (typeof envelope !== 'object' || envelope === null) throw new ProtocolError('bad frame shape')
   const e = envelope as Record<string, unknown>
-  if (e['v'] !== 1 || typeof e['n'] !== 'string' || typeof e['c'] !== 'string') {
-    throw new ProtocolError('bad frame shape')
+  if (e['v'] === 1) {
+    if (typeof e['n'] !== 'string' || typeof e['c'] !== 'string') throw new ProtocolError('bad frame shape')
+    const nonce = fromB64u(e['n'])
+    if (nonce.length !== NONCE_BYTES) throw new ProtocolError('bad nonce')
+    return { v: 1, nonce, cipher: fromB64u(e['c']) }
   }
-  const nonce = fromB64u(e['n'])
-  if (nonce.length !== NONCE_BYTES) throw new ProtocolError('bad nonce')
-  const plain = open(nonce, fromB64u(e['c']), theirPk, mySk)
-  let raw: unknown
-  try {
-    raw = JSON.parse(utf8Decode(plain))
-  } catch {
-    throw new ProtocolError('inner payload is not JSON')
+  if (e['v'] === 2) {
+    if (typeof e['sid'] !== 'string' || typeof e['rpk'] !== 'string' || typeof e['c'] !== 'string') {
+      throw new ProtocolError('bad v2 frame')
+    }
+    const pn = e['pn']
+    const n = e['n']
+    if (!Number.isInteger(pn) || !Number.isInteger(n) || (pn as number) < 0 || (n as number) < 0) {
+      throw new ProtocolError('bad v2 header')
+    }
+    if ((pn as number) > MAX_MSG_NUM || (n as number) > MAX_MSG_NUM) throw new ProtocolError('bad v2 header')
+    const sid = fromB64u(e['sid'])
+    const rpk = fromB64u(e['rpk'])
+    if (sid.length !== SID_BYTES || rpk.length !== PK_BYTES) throw new ProtocolError('bad v2 header')
+    return { v: 2, sid, rpk, pn: pn as number, n: n as number, cipher: fromB64u(e['c']) }
   }
-  return validateInner(raw)
+  throw new ProtocolError('unknown frame version')
+}
+
+/** v1 JSON frame: {v:1, n:<b64u nonce>, c:<b64u crypto_box ciphertext>}. */
+export function encodeFrame(inner: Inner, theirPk: Uint8Array, mySk: Uint8Array): string {
+  const { nonce, cipher } = seal(serializeInner(inner), theirPk, mySk)
+  return JSON.stringify({ v: 1, n: toB64u(nonce), c: toB64u(cipher) })
+}
+
+/** v2 JSON frame: {v:2, sid, rpk, pn, n, c}. The ratchet produced `header`+
+ *  `cipher`; this only frames them (no keys involved). */
+export function encodeEnvelopeV2(sid: Uint8Array, rpk: Uint8Array, pn: number, n: number, cipher: Uint8Array): string {
+  return JSON.stringify({ v: 2, sid: toB64u(sid), rpk: toB64u(rpk), pn, n, c: toB64u(cipher) })
+}
+
+/**
+ * v1 decode: returns the decrypted inner message, or null for a valid frame of
+ * an unknown kind (forward compatibility: drop, don't crash). Throws
+ * ProtocolError on a v2 frame (a v1-only build cannot read it) or on anything
+ * malformed, and CryptoError on a forged/tampered one.
+ */
+export function decodeFrame(rawText: string, theirPk: Uint8Array, mySk: Uint8Array): Inner | null {
+  if (rawText.length > MAX_FRAME) throw new ProtocolError('frame too large')
+  const env = parseEnvelope(rawText)
+  if (env.v !== 1) throw new ProtocolError('not a v1 frame')
+  return parseInner(open(env.nonce, env.cipher, theirPk, mySk))
 }
 
 function validateInner(raw: unknown): Inner | null {
@@ -194,6 +262,13 @@ function validateInner(raw: unknown): Inner | null {
     case 'del': {
       if (!isId(o['id'])) throw new ProtocolError('bad del')
       return { kind: 'del', id: o['id'] }
+    }
+    case 'react': {
+      // emoji is a short opaque string ('' removes). Capped, not whitelisted, so
+      // adding emoji to the picker later never needs a protocol bump.
+      if (!isId(o['id'])) throw new ProtocolError('bad react')
+      if (typeof o['emoji'] !== 'string' || o['emoji'].length > 16) throw new ProtocolError('bad react emoji')
+      return { kind: 'react', id: o['id'], emoji: o['emoji'] }
     }
     case 'ack':
     case 'read': {
@@ -288,6 +363,11 @@ function validateInner(raw: unknown): Inner | null {
     case 'gdel': {
       if (!isGid(o['gid']) || !isPk(o['sender']) || !isId(o['id'])) throw new ProtocolError('bad gdel')
       return { kind: 'gdel', gid: o['gid'], sender: o['sender'], id: o['id'] }
+    }
+    case 'greact': {
+      if (!isGid(o['gid']) || !isPk(o['sender']) || !isId(o['id'])) throw new ProtocolError('bad greact')
+      if (typeof o['emoji'] !== 'string' || o['emoji'].length > 16) throw new ProtocolError('bad greact emoji')
+      return { kind: 'greact', gid: o['gid'], sender: o['sender'], id: o['id'], emoji: o['emoji'] }
     }
     case 'gfile-meta': {
       if (!isGid(o['gid']) || !isPk(o['sender']) || !isId(o['id']) || !isTs(o['ts']) || !isFid(o['fid'])) {
@@ -415,15 +495,25 @@ function validateInner(raw: unknown): Inner | null {
       })
       const sProject = isText(o['project'], 120) ? o['project'] : undefined
       const sBranch = isText(o['branch'], 120) ? o['branch'] : undefined
-      return { kind: 'a-status', ts: o['ts'], state: o['state'], model: o['model'], models, queue, ...(sProject ? { project: sProject } : {}), ...(sBranch ? { branch: sBranch } : {}) }
+      const sMode = isLoose16(o['mode']) ? o['mode'] : undefined
+      const sEffort = isLoose16(o['effort']) ? o['effort'] : undefined
+      return { kind: 'a-status', ts: o['ts'], state: o['state'], model: o['model'], models, queue, ...(sProject ? { project: sProject } : {}), ...(sBranch ? { branch: sBranch } : {}), ...(sMode ? { mode: sMode } : {}), ...(sEffort ? { effort: sEffort } : {}) }
     }
     case 'a-ctl': {
       if (!isTs(o['ts'])) throw new ProtocolError('bad a-ctl')
       const model = isModelName(o['model']) ? o['model'] : undefined
       const cancel = isId(o['cancel']) ? o['cancel'] : undefined // a task id, or 'all'
       const sync = o['sync'] === true ? (true as const) : undefined
-      if (!model && !cancel && !sync) throw new ProtocolError('empty a-ctl')
-      return { kind: 'a-ctl', ts: o['ts'], ...(model ? { model } : {}), ...(cancel ? { cancel } : {}), ...(sync ? { sync } : {}) }
+      const mode = isLoose16(o['mode']) ? o['mode'] : undefined
+      const effort = isLoose16(o['effort']) ? o['effort'] : undefined
+      const steer = isId(o['steer']) ? o['steer'] : undefined
+      let move: { id: string; to: number } | undefined
+      if (o['move'] && typeof o['move'] === 'object') {
+        const mv = o['move'] as Record<string, unknown>
+        if (isId(mv['id']) && typeof mv['to'] === 'number' && Number.isInteger(mv['to']) && mv['to'] >= 0 && mv['to'] <= MAX_AGENT_QUEUE) move = { id: mv['id'], to: mv['to'] }
+      }
+      if (!model && !cancel && !sync && !mode && !effort && !steer && !move) throw new ProtocolError('empty a-ctl')
+      return { kind: 'a-ctl', ts: o['ts'], ...(model ? { model } : {}), ...(cancel ? { cancel } : {}), ...(sync ? { sync } : {}), ...(mode ? { mode } : {}), ...(effort ? { effort } : {}), ...(move ? { move } : {}), ...(steer ? { steer } : {}) }
     }
     case 'a-ask': {
       if (!isId(o['ask']) || !isId(o['msgId'])) throw new ProtocolError('bad a-ask')
@@ -492,6 +582,18 @@ function validateInner(raw: unknown): Inner | null {
       if (!isText(o['project'], 64)) throw new ProtocolError('bad a-list')
       return { kind: 'a-list', project: o['project'] }
     }
+    case 'dr-init': {
+      if (!isSid(o['sid']) || !isPk(o['eph']) || !isPk(o['rpk'])) throw new ProtocolError('bad dr-init')
+      return { kind: 'dr-init', sid: o['sid'], eph: o['eph'], rpk: o['rpk'] }
+    }
+    case 'dr-ack': {
+      if (!isSid(o['sid'])) throw new ProtocolError('bad dr-ack')
+      return { kind: 'dr-ack', sid: o['sid'] }
+    }
+    case 'dr-reset': {
+      if (!isSid(o['sid'])) throw new ProtocolError('bad dr-reset')
+      return { kind: 'dr-reset', sid: o['sid'] }
+    }
     case 'a-hist': {
       if (!isText(o['sid'], 64)) throw new ProtocolError('bad a-hist sid')
       if (typeof o['off'] !== 'number' || !Number.isInteger(o['off']) || o['off'] < 0) throw new ProtocolError('bad a-hist off')
@@ -547,6 +649,15 @@ function isGid(x: unknown): x is string {
   if (typeof x !== 'string') return false
   try {
     return fromB64u(x).length === GID_BYTES
+  } catch {
+    return false
+  }
+}
+
+function isSid(x: unknown): x is string {
+  if (typeof x !== 'string') return false
+  try {
+    return fromB64u(x).length === SID_BYTES
   } catch {
     return false
   }

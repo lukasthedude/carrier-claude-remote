@@ -29,6 +29,10 @@ export interface EngineState {
   setSession(project: string, id: string): void
   clearSession(project: string): void
   saveQueue(): void
+  /** persisted per-agent preferences; undefined = the config/SDK default */
+  readonly mode: string | undefined
+  readonly effort: string | undefined
+  setPrefs(p: { mode?: string; effort?: string }): void
 }
 
 /** One agent in the fleet: its own identity, worktree, Claude session, queue. */
@@ -49,6 +53,10 @@ export interface AgentRecord {
   sessionId?: string
   /** transcript backfill already sent to the phone (never resend on restart) */
   histSent?: boolean
+  /** permission mode override ('default'|'plan'|…); unset = config default */
+  mode?: string
+  /** reasoning effort ('low'…'max'); unset = the SDK's model default */
+  effort?: string
   queue: Task[]
 }
 
@@ -132,6 +140,17 @@ export class AgentState implements EngineState {
   clearSession(_project: string): void {
     this.rec.sessionId = undefined
     this.host.markDirty()
+  }
+  get mode(): string | undefined {
+    return this.rec.mode
+  }
+  get effort(): string | undefined {
+    return this.rec.effort
+  }
+  setPrefs(p: { mode?: string; effort?: string }): void {
+    if (p.mode !== undefined) this.rec.mode = p.mode
+    if (p.effort !== undefined) this.rec.effort = p.effort
+    this.host.save()
   }
   saveQueue(): void {
     this.host.save()
