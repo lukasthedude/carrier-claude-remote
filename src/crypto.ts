@@ -90,6 +90,12 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer
 }
 
+/** Wrap raw 32 key bytes as a non-extractable AES-256-GCM key — the bulk-crypto
+ *  DEK for a hybrid envelope (auto-backup seals only this key, not the payload). */
+export async function importAesKeyRaw(raw: Uint8Array): Promise<CryptoKey> {
+  return crypto.subtle.importKey('raw', toArrayBuffer(raw), 'AES-GCM', false, ['encrypt', 'decrypt'])
+}
+
 export function toB64u(bytes: Uint8Array): string {
   return sodium.to_base64(bytes, sodium.base64_variants.URLSAFE_NO_PADDING)
 }
@@ -142,6 +148,15 @@ export function sealOpen(sealed: Uint8Array, myPk: Uint8Array, mySk: Uint8Array)
   } catch {
     throw new CryptoError('seal open failed')
   }
+}
+
+/** Anonymous sealed box TO a public key — encrypt-only, no sender key. The
+ *  ephemeral sender key is baked in and discarded, so the box is unlinkable and
+ *  openable solely by `theirPk`'s owner. Inverse of sealOpen(); used to seal an
+ *  auto-backup to the user's own identity (opened later via the recovery code). */
+export function sealTo(plain: Uint8Array, theirPk: Uint8Array): Uint8Array {
+  if (theirPk.length !== PK_BYTES) throw new CryptoError('bad public key length')
+  return sodium.crypto_box_seal(plain, theirPk)
 }
 
 export function blake2b(outLen: number, ...parts: Uint8Array[]): Uint8Array {

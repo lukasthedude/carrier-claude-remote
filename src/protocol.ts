@@ -132,7 +132,10 @@ export type Inner =
   | { kind: 'a-host'; ts: number; agents: { pk: string; name: string; state: string; project?: string; branch?: string }[]; projects: { name: string }[] }
   | { kind: 'a-sessions'; project: string; sessions: { id: string; title: string; branch?: string; updatedAt: number }[] }
   | { kind: 'a-spawn'; ts: number; project: string; branch?: string; attach?: string }
-  | { kind: 'a-close'; ts: number; pk: string }
+  // `archive:true` = Conductor-style archive: the host stops the agent and
+  // removes its worktree but KEEPS the record (and flips the Conductor
+  // workspace to archived) — the phone keeps the chat in its Archived folder.
+  | { kind: 'a-close'; ts: number; pk: string; archive?: true }
   | { kind: 'a-list'; project: string }
   // agent→owner, once, after attaching to an existing session: the recent
   // transcript (chunked oldest-first; `off`/`total` place each chunk), so the
@@ -576,7 +579,8 @@ function validateInner(raw: unknown): Inner | null {
     }
     case 'a-close': {
       if (!isTs(o['ts']) || !isPk(o['pk'])) throw new ProtocolError('bad a-close')
-      return { kind: 'a-close', ts: o['ts'], pk: o['pk'] }
+      const archive = o['archive'] === true ? (true as const) : undefined
+      return { kind: 'a-close', ts: o['ts'], pk: o['pk'], ...(archive ? { archive } : {}) }
     }
     case 'a-list': {
       if (!isText(o['project'], 64)) throw new ProtocolError('bad a-list')

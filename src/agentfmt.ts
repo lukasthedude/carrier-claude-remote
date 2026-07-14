@@ -66,6 +66,116 @@ export function hasCode(text: string): boolean {
   return parseFences(text).some((s) => s.code)
 }
 
+// ---------- lightweight markdown for agent replies -------------------------
+// Claude writes markdown; a chat bubble full of raw `**` and `##` is noise.
+// This parses just the shapes Claude actually uses — headings, bullet/numbered
+// lists, paragraphs, fenced code, and inline bold/`code` — into typed blocks
+// the UI renders as DOM nodes (textContent only, never innerHTML). Anything
+// unrecognized stays a plain paragraph, so nothing is ever lost.
+
+export interface Span {
+  text: string
+  bold?: boolean
+  code?: boolean
+}
+
+export type Block =
+  | { type: 'p'; spans: Span[] }
+  | { type: 'h'; level: 1 | 2 | 3; spans: Span[] }
+  | { type: 'list'; ordered: boolean; items: Span[][] }
+  | { type: 'code'; text: string; lang?: string }
+
+/** Inline `code` and **bold** runs; code wins over bold, no nesting. */
+export function parseInline(text: string): Span[] {
+  const out: Span[] = []
+  let plain = ''
+  let i = 0
+  const flush = () => {
+    if (plain) {
+      out.push({ text: plain })
+      plain = ''
+    }
+  }
+  while (i < text.length) {
+    if (text[i] === '`') {
+      const end = text.indexOf('`', i + 1)
+      if (end > i + 1) {
+        flush()
+        out.push({ text: text.slice(i + 1, end), code: true })
+        i = end + 1
+        continue
+      }
+    }
+    if (text.startsWith('**', i)) {
+      const end = text.indexOf('**', i + 2)
+      if (end > i + 2) {
+        flush()
+        out.push({ text: text.slice(i + 2, end), bold: true })
+        i = end + 2
+        continue
+      }
+    }
+    plain += text[i]
+    i++
+  }
+  flush()
+  return out
+}
+
+export function parseBlocks(text: string): Block[] {
+  const out: Block[] = []
+  for (const seg of parseFences(text)) {
+    if (seg.code) {
+      out.push({ type: 'code', text: seg.text, ...(seg.lang ? { lang: seg.lang } : {}) })
+      continue
+    }
+    let para: string[] = []
+    let list: { ordered: boolean; items: string[] } | null = null
+    const flushPara = () => {
+      if (para.length) {
+        out.push({ type: 'p', spans: parseInline(para.join('\n')) })
+        para = []
+      }
+    }
+    const flushList = () => {
+      if (list) {
+        out.push({ type: 'list', ordered: list.ordered, items: list.items.map(parseInline) })
+        list = null
+      }
+    }
+    for (const raw of seg.text.split('\n')) {
+      const line = raw.trimEnd()
+      if (!line.trim()) {
+        flushPara()
+        flushList()
+        continue
+      }
+      const h = /^(#{1,3})\s+(.*)$/.exec(line)
+      if (h) {
+        flushPara()
+        flushList()
+        out.push({ type: 'h', level: h[1]!.length as 1 | 2 | 3, spans: parseInline(h[2]!) })
+        continue
+      }
+      const bullet = /^\s*[-*•]\s+(.*)$/.exec(line)
+      const numbered = /^\s*\d{1,3}[.)]\s+(.*)$/.exec(line)
+      if (bullet || numbered) {
+        flushPara()
+        const ordered = !!numbered
+        if (list && list.ordered !== ordered) flushList()
+        if (!list) list = { ordered, items: [] }
+        list.items.push((bullet ?? numbered)![1]!)
+        continue
+      }
+      flushList()
+      para.push(line)
+    }
+    flushPara()
+    flushList()
+  }
+  return out
+}
+
 /**
  * A friendly model label for the chat header/picker, the way Anthropic writes
  * them: 'claude-fable-5' → 'Fable 5', 'claude-opus-4-8' → 'Opus 4.8',

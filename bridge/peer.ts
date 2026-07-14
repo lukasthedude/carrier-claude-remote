@@ -39,7 +39,7 @@ export interface PeerHandlers {
   onOwnerConnected?(): void
   // host role
   onSpawn?(spawn: { project: string; branch?: string; attach?: string }): void
-  onClose?(pk: string): void
+  onClose?(pk: string, archive?: boolean): void
   onList?(project: string): void
 }
 
@@ -136,7 +136,7 @@ export class CarrierPeer {
         this.handlers?.onSpawn?.({ project: inner.project, ...(inner.branch ? { branch: inner.branch } : {}), ...(inner.attach ? { attach: inner.attach } : {}) })
         return
       case 'a-close':
-        this.handlers?.onClose?.(inner.pk)
+        this.handlers?.onClose?.(inner.pk, inner.archive === true)
         return
       case 'a-list':
         this.handlers?.onList?.(inner.project)

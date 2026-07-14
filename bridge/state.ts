@@ -53,6 +53,8 @@ export interface AgentRecord {
   sessionId?: string
   /** transcript backfill already sent to the phone (never resend on restart) */
   histSent?: boolean
+  /** archived (Conductor-style): stopped, worktree removed, record kept */
+  archived?: boolean
   /** permission mode override ('default'|'plan'|…); unset = config default */
   mode?: string
   /** reasoning effort ('low'…'max'); unset = the SDK's model default */
@@ -106,6 +108,15 @@ export class HostState {
   removeAgent(pk: string): void {
     this.s.agents = this.s.agents.filter((a) => a.pk !== pk)
     this.store.flushSync()
+  }
+  /** Keep the record (branch, session id, history of what it was) — just mark
+   *  it archived so it never gets a runtime or a roster slot again. */
+  archiveAgent(pk: string): void {
+    const a = this.s.agents.find((x) => x.pk === pk)
+    if (a) {
+      a.archived = true
+      this.store.flushSync()
+    }
   }
 
   save(): void {

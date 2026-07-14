@@ -34,7 +34,7 @@ export class HostController implements PeerHandlers {
       onSignupGate,
     })
     this.host.handlers = this
-    for (const rec of state.agents) this.attachRuntime(rec) // restore the fleet
+    for (const rec of state.agents) if (!rec.archived) this.attachRuntime(rec) // restore the (live) fleet
   }
 
   start(): void {
@@ -71,8 +71,8 @@ export class HostController implements PeerHandlers {
   onSpawn(spawn: { project: string; branch?: string; attach?: string }): void {
     void this.spawn(spawn)
   }
-  onClose(pk: string): void {
-    void this.closeAgent(pk)
+  onClose(pk: string, archive?: boolean): void {
+    void this.closeAgent(pk, archive)
   }
   onList(project: string): void {
     void this.sendSessionsFor(project)
@@ -145,15 +145,19 @@ export class HostController implements PeerHandlers {
     }
   }
 
-  private async closeAgent(pk: string): Promise<void> {
+  private async closeAgent(pk: string, archive = false): Promise<void> {
     const rt = this.agents.get(pk)
     if (!rt) return
     rt.stop()
     this.agents.delete(pk)
-    this.state.removeAgent(pk)
+    // Archive = Conductor archive: the worktree goes either way (the branch and
+    // session survive), but the record is kept and the Conductor workspace row
+    // flips to 'archived' instead of vanishing.
+    if (archive) this.state.archiveAgent(pk)
+    else this.state.removeAgent(pk)
     if (rt.rec.worktree) {
       const spec = this.config.projects[rt.rec.project]
-      if (spec) await this.sessions.removeWorktree(rt.rec.cwd, spec)
+      if (spec) await this.sessions.removeWorktree(rt.rec.cwd, spec, archive)
     }
     this.announceRoster()
   }

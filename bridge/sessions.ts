@@ -71,7 +71,9 @@ export interface SessionManager {
   /** The recent human-readable transcript of a session (for the phone backfill). */
   getSessionHistory(id: string, spec: ProjectSpec): Promise<HistEntry[]>
   createWorktree(spec: ProjectSpec, branch: string): Promise<{ path: string }>
-  removeWorktree(cwd: string, spec: ProjectSpec): Promise<void>
+  /** `archive` = keep the trail: the Conductor workspace row flips to
+   *  'archived' (like Conductor's own archive) instead of being deleted. */
+  removeWorktree(cwd: string, spec: ProjectSpec, archive?: boolean): Promise<void>
 }
 
 /** Most transcript turns backfilled into the phone chat on attach. */
@@ -169,13 +171,17 @@ export class SdkSessions implements SessionManager {
     return { path }
   }
 
-  async removeWorktree(cwd: string, spec: ProjectSpec): Promise<void> {
+  async removeWorktree(cwd: string, spec: ProjectSpec, archive = false): Promise<void> {
     await exec('git', ['-C', spec.repo, 'worktree', 'remove', '--force', cwd], { timeout: 30_000 }).catch((e) =>
       console.error(`[sessions] worktree remove failed: ${(e as Error).message}`),
     )
-    // drop the Conductor registry row if this was a Conductor-managed worktree
-    if (this.conductor && existsSync(this.dbPath) && cwd.startsWith(this.wsRoot + '/'))
-      await exec('sqlite3', [this.dbPath, `PRAGMA busy_timeout=5000; DELETE FROM workspaces WHERE workspace_path=${sqlStr(cwd)};`], { timeout: 8_000 }).catch(() => {})
+    if (!(this.conductor && existsSync(this.dbPath) && cwd.startsWith(this.wsRoot + '/'))) return
+    // Conductor-managed worktree: archive keeps the row (state → 'archived',
+    // exactly what Conductor's own Archive does); close deletes it.
+    const sql = archive
+      ? `PRAGMA busy_timeout=5000; UPDATE workspaces SET state='archived', updated_at=datetime('now') WHERE workspace_path=${sqlStr(cwd)};`
+      : `PRAGMA busy_timeout=5000; DELETE FROM workspaces WHERE workspace_path=${sqlStr(cwd)};`
+    await exec('sqlite3', [this.dbPath, sql], { timeout: 8_000 }).catch(() => {})
   }
 
   /** If this repo is registered in Conductor, return its id + default branch +
@@ -247,7 +253,7 @@ export class FakeSessions implements SessionManager {
     this.created.push(path)
     return { path }
   }
-  async removeWorktree(cwd: string): Promise<void> {
+  async removeWorktree(cwd: string, _spec: ProjectSpec, _archive?: boolean): Promise<void> {
     rmSync(cwd, { recursive: true, force: true })
   }
 }
