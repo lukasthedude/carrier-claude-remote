@@ -47,6 +47,8 @@ export interface AgentRecord {
   model: string
   /** Claude Code session id — from an attach, or captured on first run */
   sessionId?: string
+  /** transcript backfill already sent to the phone (never resend on restart) */
+  histSent?: boolean
   queue: Task[]
 }
 

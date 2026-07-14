@@ -79,7 +79,7 @@ async function printPairing(code: string, relayUrl: string): Promise<void> {
   const link = `${webOrigin(relayUrl)}/#i=${code}`
   console.log('\n  ── Pair this Mac ───────────────────────────────────────')
   console.log('  In Carrier: Settings → Claude Remote (on), open the CC tab →')
-  console.log('  “Set up an agent”, and paste this code (or scan the QR):\n')
+  console.log('  “Connect a Mac”, and paste this code (or scan the QR):\n')
   console.log(`  ${code}\n`)
   console.log(`  or open on your phone:  ${link}`)
   await printQr(link)

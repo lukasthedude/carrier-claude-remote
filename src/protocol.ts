@@ -18,6 +18,10 @@ export const MAX_AGENT_QUESTIONS = 4
 export const MAX_HOST_AGENTS = 24
 /** Most resumable sessions an `a-sessions` list carries. */
 export const MAX_HOST_SESSIONS = 60
+/** Most transcript entries one `a-hist` chunk carries (frames stay ≪ 64KB). */
+export const MAX_HIST_ENTRIES = 12
+/** Longest text one backfilled transcript entry keeps. */
+export const MAX_HIST_TEXT = 2500
 const MAX_FRAME = 65_536
 const FID_BYTES = 16
 const GID_BYTES = 16 // a group id is 16 random bytes (22 b64u chars) — never collides with a 32-byte pk
@@ -110,6 +114,10 @@ export type Inner =
   | { kind: 'a-spawn'; ts: number; project: string; branch?: string; attach?: string }
   | { kind: 'a-close'; ts: number; pk: string }
   | { kind: 'a-list'; project: string }
+  // agent→owner, once, after attaching to an existing session: the recent
+  // transcript (chunked oldest-first; `off`/`total` place each chunk), so the
+  // phone chat opens with the same conversation the desktop already had.
+  | { kind: 'a-hist'; sid: string; off: number; total: number; entries: { role: string; text: string; ts: number }[] }
 
 /** Most inclusive [start, end] ranges one file-req may carry. */
 export const MAX_REQ_RANGES = 256
@@ -483,6 +491,20 @@ function validateInner(raw: unknown): Inner | null {
     case 'a-list': {
       if (!isText(o['project'], 64)) throw new ProtocolError('bad a-list')
       return { kind: 'a-list', project: o['project'] }
+    }
+    case 'a-hist': {
+      if (!isText(o['sid'], 64)) throw new ProtocolError('bad a-hist sid')
+      if (typeof o['off'] !== 'number' || !Number.isInteger(o['off']) || o['off'] < 0) throw new ProtocolError('bad a-hist off')
+      if (typeof o['total'] !== 'number' || !Number.isInteger(o['total']) || o['total'] < 1 || o['total'] > 500) throw new ProtocolError('bad a-hist total')
+      const rawEntries = o['entries']
+      if (!Array.isArray(rawEntries) || rawEntries.length < 1 || rawEntries.length > MAX_HIST_ENTRIES) throw new ProtocolError('bad a-hist entries')
+      const entries = rawEntries.map((raw) => {
+        const e = raw as Record<string, unknown>
+        if (!isLoose16(e['role']) || !isTs(e['ts'])) throw new ProtocolError('bad a-hist entry')
+        if (typeof e['text'] !== 'string' || e['text'].length === 0 || e['text'].length > MAX_HIST_TEXT) throw new ProtocolError('bad a-hist text')
+        return { role: e['role'], text: e['text'], ts: e['ts'] }
+      })
+      return { kind: 'a-hist', sid: o['sid'], off: o['off'], total: o['total'], entries }
     }
     default:
       return null // unknown kind from a future version: drop silently

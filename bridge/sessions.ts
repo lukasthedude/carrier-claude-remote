@@ -10,6 +10,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { randomBytes, toB64u } from '../src/crypto'
+import { MAX_HIST_TEXT } from '../src/protocol'
 import type { ProjectSpec } from './config'
 
 const exec = promisify(execFile)
@@ -32,6 +33,23 @@ const CITY_POOL =
 /** Escape a value for inlining into a `sqlite3` statement (paths/ids only). */
 const sqlStr = (s: string): string => `'${String(s).replace(/'/g, "''")}'`
 
+/** The human-readable text of one transcript message: a plain-string content,
+ *  or its text blocks joined. Tool chatter and command/system noise → ''. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function histText(message: any): string {
+  const content = message?.content
+  let text = ''
+  if (typeof content === 'string') text = content
+  else if (Array.isArray(content))
+    text = content
+      .filter((b: { type?: string }) => b?.type === 'text')
+      .map((b: { text?: string }) => b.text ?? '')
+      .join('\n\n')
+  text = text.trim()
+  if (/^<(command-name|command-message|local-command|system-reminder|task-notification)/.test(text)) return ''
+  return text
+}
+
 export interface SessionInfo {
   id: string
   title: string
@@ -40,12 +58,24 @@ export interface SessionInfo {
   cwd: string
 }
 
+/** One backfilled transcript turn (a-hist entry). */
+export interface HistEntry {
+  role: 'user' | 'assistant'
+  text: string
+  ts: number
+}
+
 export interface SessionManager {
   listSessions(spec: ProjectSpec): Promise<SessionInfo[]>
   getSession(id: string, spec: ProjectSpec): Promise<SessionInfo | undefined>
+  /** The recent human-readable transcript of a session (for the phone backfill). */
+  getSessionHistory(id: string, spec: ProjectSpec): Promise<HistEntry[]>
   createWorktree(spec: ProjectSpec, branch: string): Promise<{ path: string }>
   removeWorktree(cwd: string, spec: ProjectSpec): Promise<void>
 }
+
+/** Most transcript turns backfilled into the phone chat on attach. */
+const MAX_HIST_BACKFILL = 24
 
 const slug = (s: string) => s.replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 40) || 'agent'
 export const genBranch = () => `cc/${toB64u(randomBytes(4)).toLowerCase().replace(/[^a-z0-9]/g, '')}`
@@ -91,6 +121,31 @@ export class SdkSessions implements SessionManager {
 
   async getSession(id: string, spec: ProjectSpec): Promise<SessionInfo | undefined> {
     return (await this.listSessions(spec)).find((s) => s.id === id)
+  }
+
+  async getSessionHistory(id: string, spec: ProjectSpec): Promise<HistEntry[]> {
+    try {
+      const sdk = await this.sdk()
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rows: any[] = await sdk.getSessionMessages(id, { dir: spec.repo })
+      const turns: HistEntry[] = []
+      for (const r of rows) {
+        if ((r.type !== 'user' && r.type !== 'assistant') || r.parent_tool_use_id) continue
+        const text = histText(r.message)
+        if (!text) continue
+        turns.push({ role: r.type, text: text.slice(0, MAX_HIST_TEXT), ts: 0 })
+      }
+      // The SDK exposes no per-message timestamps — anchor the tail to the
+      // session's last activity, one second apart, so ordering (and the day
+      // divider) land right without inventing precise clock times.
+      const tail = turns.slice(-MAX_HIST_BACKFILL)
+      const anchor = (await this.getSession(id, spec))?.updatedAt ?? Date.now()
+      tail.forEach((e, i) => (e.ts = anchor - (tail.length - i) * 1000))
+      return tail
+    } catch (e) {
+      console.error(`[sessions] history failed: ${(e as Error).message}`)
+      return []
+    }
   }
 
   async createWorktree(spec: ProjectSpec, branch: string): Promise<{ path: string }> {
@@ -178,6 +233,14 @@ export class FakeSessions implements SessionManager {
   }
   async getSession(id: string, spec: ProjectSpec): Promise<SessionInfo | undefined> {
     return (await this.listSessions(spec)).find((s) => s.id === id)
+  }
+  async getSessionHistory(id: string, _spec: ProjectSpec): Promise<HistEntry[]> {
+    if (id !== 'sess-live') return []
+    return [
+      { role: 'user', text: 'build the remote agent feature', ts: 1783619197000 },
+      { role: 'assistant', text: 'Shipped it — the CC tab now pairs with your Mac.', ts: 1783619198000 },
+      { role: 'user', text: 'now make attach load history', ts: 1783619199000 },
+    ]
   }
   async createWorktree(spec: ProjectSpec, _branch: string): Promise<{ path: string }> {
     const path = mkdtempSync(join(spec.worktreesDir || tmpdir(), 'cc-wt-'))

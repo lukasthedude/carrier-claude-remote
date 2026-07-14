@@ -4,7 +4,7 @@
 // channel (caps:['cc','host'], pins its own owner, speaks a-host/a-spawn/…).
 
 import { formatSafetyNumber, fromB64u, randomBytes, safetyNumber, toB64u, utf8Encode, type Identity } from '../src/crypto'
-import { decodeFrame, encodeFrame, type Inner } from '../src/protocol'
+import { decodeFrame, encodeFrame, MAX_HIST_ENTRIES, type Inner } from '../src/protocol'
 import { chunkText } from './chunk'
 import { BridgeRelay } from './relay'
 import type { AskQuestion } from './runner'
@@ -202,6 +202,14 @@ export class CarrierPeer {
   sendSessions(project: string, sessions: { id: string; title: string; branch?: string; updatedAt: number }[]): void {
     if (!this.ownerPk) return
     this.sendInner(this.ownerPk, { kind: 'a-sessions', project, sessions })
+  }
+
+  /** Backfill an attached session's recent transcript to the phone, chunked.
+   *  Mailboxed (store:true) but never pushed — history shouldn't buzz anyone. */
+  sendHist(sid: string, entries: { role: string; text: string; ts: number }[]): void {
+    if (!this.ownerPk || entries.length === 0) return
+    for (let off = 0; off < entries.length; off += MAX_HIST_ENTRIES)
+      this.sendInner(this.ownerPk, { kind: 'a-hist', sid, off, total: entries.length, entries: entries.slice(off, off + MAX_HIST_ENTRIES) })
   }
 
   private sendInner(to: string, inner: Inner): void {

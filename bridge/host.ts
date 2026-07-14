@@ -128,8 +128,21 @@ export class HostController implements PeerHandlers {
       queue: [],
     }
     this.state.addAgent(rec)
-    this.attachRuntime(rec).start()
+    const rt = this.attachRuntime(rec)
+    rt.start()
     this.announceRoster()
+    // Attached to an existing conversation → backfill its recent transcript so
+    // the phone chat opens right where the desktop left off. Once per agent
+    // (histSent survives restarts); best-effort — the relay queues the frames
+    // until the agent's socket is ready, and mailboxes them for an offline phone.
+    if (sessionId && !rec.histSent) {
+      void this.sessions.getSessionHistory(sessionId, spec).then((hist) => {
+        if (!hist.length) return
+        rt.peer.sendHist(sessionId, hist)
+        rec.histSent = true
+        this.state.save()
+      })
+    }
   }
 
   private async closeAgent(pk: string): Promise<void> {
