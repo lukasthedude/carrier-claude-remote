@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   const engine = new Engine(peer, runner, config, state)
   peer.handlers = engine
 
-  console.log(`\n  Carrier bridge — “${config.name}”`)
+  console.log(`\n  Claude Remote — “${config.name}”`)
   console.log(`  State: ${dir}`)
   console.log(`  Relay: ${config.relay}   Runner: ${runnerKind}`)
   const projects = Object.keys(config.projects)

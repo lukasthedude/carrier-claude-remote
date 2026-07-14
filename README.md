@@ -1,4 +1,4 @@
-# Carrier bridge
+# Claude Remote for Carrier
 
 Turn a Mac you leave running into a **Claude Code agent you talk to from
 [Carrier](https://thecarrier.org) on your phone**. Text it coding tasks —
@@ -6,6 +6,10 @@ Turn a Mac you leave running into a **Claude Code agent you talk to from
 back, asking you to approve anything risky. The Mac does the work; your phone is
 the remote. Everything is end-to-end encrypted, exactly like a normal Carrier
 chat.
+
+This repo is the piece that runs on your Mac — a small **bridge** process that
+connects Carrier to Claude Code. Your phone drives it from Carrier's **CC** tab
+(turn on **Settings → Claude Remote** first).
 
 ```
   phone (Carrier · CC tab)  ⇄  blind relay  ⇄  this bridge (your Mac)  ⇄  Claude Code  ⇄  Anthropic
@@ -41,13 +45,13 @@ phone by pasting a code, just like adding a friend.
 npm install -g @anthropic-ai/claude-code   # (sudo if it says permission denied)
 claude                                       # sign in once, then /exit
 
-# 2) Get this bridge and its dependencies
-git clone https://github.com/lukasthedude/carrier-bridge.git   # or download the ZIP
-cd carrier-bridge
+# 2) Get this repo and its dependencies
+git clone https://github.com/lukasthedude/carrier-claude-remote.git   # or download the ZIP
+cd carrier-claude-remote
 npm install
 
-# 3) First run writes a config, then stops for you to edit it
-npm run bridge
+# 3) First run writes a config, then you edit it
+npm start
 ```
 
 Open `~/.carrier-bridge/config.json` (`open ~/.carrier-bridge/config.json`) and
@@ -58,7 +62,7 @@ set at least:
 - `projects` — the folder(s) it may work on, e.g. `{ "site": "/Users/me/dev/site" }`
 - `defaultProject` — which one a bare task uses
 
-Then run `npm run bridge` again. It prints a **chat code and a QR**.
+Then run `npm start` again. It prints a **chat code and a QR**.
 
 ## Pair your phone
 
@@ -68,7 +72,7 @@ Then run `npm run bridge` again. It prints a **chat code and a QR**.
    (open the agent chat → ⋯ → **Verify safety number**). They must match.
 
 The first phone to pair becomes the **owner** and is pinned forever; every other
-sender is ignored. Re-pair with a different phone: `npm run bridge -- --reset-owner`.
+sender is ignored. Re-pair with a different phone: `npm start -- --reset-owner`.
 
 ## Using it
 
@@ -113,7 +117,7 @@ Your own `~/.claude` allow/deny rules still apply on top (deny always wins).
 - **"turned this agent away (signup)"** — put the relay access code in
   `~/.carrier-bridge/config.json` → `signupCode`, then restart.
 - **"Claude Agent SDK not installed"** — `npm install` in this folder again.
-- **Re-pair / wrong phone** — `npm run bridge -- --reset-owner`, then pair again.
+- **Re-pair / wrong phone** — `npm start -- --reset-owner`, then pair again.
 - **See what it's doing** — `tail -f ~/.carrier-bridge/bridge.log`.
 
 ## Config reference

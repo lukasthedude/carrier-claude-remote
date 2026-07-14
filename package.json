@@ -1,14 +1,15 @@
 {
-  "name": "carrier-bridge",
+  "name": "carrier-claude-remote",
   "version": "1.0.0",
   "private": false,
   "type": "module",
-  "description": "Run a Claude Code agent on your Mac and drive it from Carrier on your phone.",
+  "description": "Run a Claude Code agent on your Mac and drive it from Carrier on your phone (Claude Remote).",
   "license": "MIT",
   "engines": {
     "node": ">=20.19"
   },
   "scripts": {
+    "start": "tsx bridge/main.ts",
     "bridge": "tsx bridge/main.ts",
     "typecheck": "tsc --noEmit"
   },

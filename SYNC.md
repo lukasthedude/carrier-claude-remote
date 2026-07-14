@@ -24,3 +24,10 @@ npm run typecheck   # confirm it still builds
 
 Nothing else from the app is needed here — the bridge only imports those three
 modules (verified: `grep -rE "from '\.\./src/" bridge`).
+
+**One divergence to preserve:** `bridge/main.ts` here uses the product wording —
+the banner says "Claude Remote" and the pairing hint says "CC tab → Set up an
+agent". The private repo's copy may still say "Carrier bridge" / "Claude tab →
+Pair an agent". If you copy `main.ts` over, re-apply those two lines (or keep
+this file's `main.ts`, which only differs in that console output).
+
