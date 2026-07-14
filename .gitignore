@@ -1,0 +1,4 @@
+node_modules/
+# never commit a real bridge state dir if someone points CARRIER_BRIDGE_DIR here
+.carrier-bridge/
+*.log

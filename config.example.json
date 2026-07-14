@@ -1,0 +1,14 @@
+{
+  "relay": "wss://thecarrier.org/ws",
+  "signupCode": "ask-whoever-invited-you",
+  "name": "My Mac",
+  "projects": { "example": "/Users/you/path/to/a/project" },
+  "defaultProject": "example",
+  "model": "sonnet",
+  "models": ["opus", "sonnet", "haiku"],
+  "permissionMode": "default",
+  "progress": "all",
+  "maxQueue": 20,
+  "private": false,
+  "runner": "sdk"
+}

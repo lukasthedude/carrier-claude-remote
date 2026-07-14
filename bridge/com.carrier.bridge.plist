@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template to keep the Carrier bridge running (and restart it on crash /
+  login). Edit the two absolute paths below, then:
+
+    cp bridge/com.carrier.bridge.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.carrier.bridge.plist
+    launchctl enable gui/$(id -u)/com.carrier.bridge
+
+  Stop / uninstall:
+    launchctl bootout gui/$(id -u)/com.carrier.bridge
+
+  Logs land in ~/.carrier-bridge/bridge.log.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.carrier.bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- absolute path to npx (run `which npx`) -->
+    <string>/REPLACE/WITH/PATH/TO/npx</string>
+    <string>tsx</string>
+    <string>bridge/main.ts</string>
+  </array>
+
+  <!-- absolute path to your clone of this repo -->
+  <key>WorkingDirectory</key>
+  <string>/REPLACE/WITH/PATH/TO/carrier</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- give the bridge your login PATH so `claude`, node, and npx resolve -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE/.carrier-bridge/bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE/.carrier-bridge/bridge.log</string>
+</dict>
+</plist>
