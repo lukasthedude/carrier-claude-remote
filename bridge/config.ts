@@ -6,16 +6,26 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+/** A project the host can spawn agents on. */
+export interface ProjectSpec {
+  /** the project's git checkout — where `git worktree` runs and the default cwd */
+  repo: string
+  /** where new agent worktrees are created (default: a sibling dir of `repo`) */
+  worktreesDir?: string
+  /** base ref for new branches (default 'origin/main') */
+  base?: string
+}
+
 export interface BridgeConfig {
   /** relay WebSocket URL (production by default) */
   relay: string
   /** the relay's invite/access code — needed only on the very first connect */
   signupCode: string
-  /** the name this agent shows as, as a contact on your phone */
+  /** the name the HOST shows as, as a contact on your phone */
   name: string
-  /** project name → absolute path; Claude runs each task in one of these */
-  projects: Record<string, string>
-  /** which project a bare task uses */
+  /** project name → spec; the host spawns agents (worktrees) on these */
+  projects: Record<string, ProjectSpec>
+  /** which project a bare task uses (mostly legacy; the host spawns explicitly) */
   defaultProject: string
   /** default model (alias or full id) */
   model: string
@@ -26,9 +36,9 @@ export interface BridgeConfig {
   permissionMode: 'default' | 'acceptEdits' | 'bypassPermissions'
   /** 'all' = forward Claude's intermediate notes; 'final' = only the result */
   progress: 'all' | 'final'
-  /** most tasks to hold queued */
+  /** most tasks to hold queued per agent */
   maxQueue: number
-  /** hide the bridge's presence from relay watchers (hello priv) */
+  /** hide presence from relay watchers (hello priv) */
   private: boolean
   /** 'sdk' = drive Claude Code; 'fake' = deterministic stub (tests) */
   runner: 'sdk' | 'fake'
@@ -37,7 +47,7 @@ export interface BridgeConfig {
 const DEFAULTS: BridgeConfig = {
   relay: 'wss://thecarrier.org/ws',
   signupCode: '',
-  name: 'Claude · Mac',
+  name: 'My Mac',
   projects: {},
   defaultProject: '',
   model: 'sonnet',
@@ -49,15 +59,16 @@ const DEFAULTS: BridgeConfig = {
   runner: 'sdk',
 }
 
-/** The bridge state dir (created 0700). All state — identity, config, queue. */
+/** The bridge state dir (created 0700). Holds identity, config, host.json. */
 export function bridgeDir(): string {
   const dir = process.env['CARRIER_BRIDGE_DIR'] || join(homedir(), '.carrier-bridge')
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   return dir
 }
 
-/** Load config.json, writing defaults on first run. Normalizes the default
- *  project to a real one so the engine always has a cwd to fall back to. */
+/** Load config.json, writing defaults on first run. Normalizes each project to a
+ *  ProjectSpec (a bare string path is accepted for back-compat) and pins a real
+ *  default project. */
 export function loadConfig(dir: string): BridgeConfig {
   const path = join(dir, 'config.json')
   if (!existsSync(path)) {
@@ -71,15 +82,19 @@ export function loadConfig(dir: string): BridgeConfig {
     console.error(`[config] ${path} is not valid JSON (${(e as Error).message}); using defaults`)
   }
   const cfg: BridgeConfig = { ...DEFAULTS, ...raw }
+  const projects: Record<string, ProjectSpec> = {}
+  for (const [name, v] of Object.entries(cfg.projects ?? {})) {
+    projects[name] = typeof v === 'string' ? { repo: v } : (v as ProjectSpec)
+  }
+  cfg.projects = projects
   const names = Object.keys(cfg.projects)
   if (!cfg.defaultProject || !cfg.projects[cfg.defaultProject]) cfg.defaultProject = names[0] ?? ''
   if (!Array.isArray(cfg.models) || cfg.models.length === 0) cfg.models = DEFAULTS.models
   return cfg
 }
 
-/** Resolve a project name to a working directory, falling back to the default
- *  project and finally the process cwd (so a zero-config run still works). */
+/** Resolve a project name to a working directory (its repo), else process cwd. */
 export function projectCwd(cfg: BridgeConfig, project?: string): string {
   const name = project && cfg.projects[project] ? project : cfg.defaultProject
-  return (name && cfg.projects[name]) || process.cwd()
+  return (name && cfg.projects[name]?.repo) || process.cwd()
 }

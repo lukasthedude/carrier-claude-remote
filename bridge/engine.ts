@@ -9,7 +9,7 @@ import { HELP_TEXT, parseCommand } from './commands'
 import { classifyTool } from './policy'
 import type { AgentQuestion, CarrierPeer, PeerHandlers } from './peer'
 import type { ClaudeRunner, RunContext } from './runner'
-import { taskTitle, type BridgeState, type Task } from './state'
+import { taskTitle, type EngineState, type Task } from './state'
 
 const TYPING_PULSE_MS = 4000
 // a-ctl is mailboxed (survives a brief drop), so a cancel older than this is
@@ -39,7 +39,7 @@ export class Engine implements PeerHandlers {
     private peer: CarrierPeer,
     private runner: ClaudeRunner,
     private config: BridgeConfig,
-    private state: BridgeState,
+    private state: EngineState,
   ) {
     this.currentModel = config.model
     this.currentProject = config.defaultProject

@@ -1,21 +1,20 @@
-// Carrier bridge — a headless Carrier peer that turns your Mac into a Claude
-// Code agent you talk to from your phone. First run generates an identity and
-// prints a chat code to pair; after that it just connects and waits for tasks.
+// Carrier · Claude Remote — a headless HOST on your Mac. Pair it once from the
+// phone, then spawn many agents (each its own chat, its own worktree/session).
 //
-//   npm run bridge            # start (edit ~/.carrier-bridge/config.json first)
-//   npm run bridge -- --code  # print the chat code and exit
-//   npm run bridge -- --reset-owner   # forget the paired phone, re-pair
+//   npm start                  # run the host (edit ~/.carrier-bridge/config.json first)
+//   npm start -- --code        # print the pairing code and exit
+//   npm start -- --reset-owner # forget the paired phone + fleet, re-pair
 
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { initCrypto } from '../src/crypto'
 import { bridgeDir, loadConfig } from './config'
-import { Engine } from './engine'
-import { CarrierPeer } from './peer'
+import { HostController } from './host'
 import type { ClaudeRunner } from './runner'
 import { FakeRunner } from './runner-fake'
 import { SdkRunner } from './runner-sdk'
-import { BridgeState } from './state'
+import { FakeSessions, SdkSessions, type SessionManager } from './sessions'
+import { HostState } from './state'
 
 async function main(): Promise<void> {
   const args = new Set(process.argv.slice(2))
@@ -24,32 +23,31 @@ async function main(): Promise<void> {
   const dir = bridgeDir()
   const firstRun = !existsSync(join(dir, 'identity.json'))
   const config = loadConfig(dir)
-  const state = new BridgeState(dir)
+  const state = new HostState(dir)
 
   if (args.has('--reset-owner')) {
     state.clearOwner()
-    console.log('Owner unpaired. Pair again from your phone to re-own this agent.')
+    console.log('Owner unpaired (and the fleet cleared). Pair again from your phone to re-own this host.')
   }
 
   const runnerKind = process.env['CARRIER_BRIDGE_RUNNER'] || config.runner
   const runner: ClaudeRunner = runnerKind === 'fake' ? new FakeRunner() : new SdkRunner()
+  const sessions: SessionManager = runnerKind === 'fake' ? new FakeSessions() : new SdkSessions()
 
-  const peer = new CarrierPeer(state, config, (code, msg) => {
-    console.error(`\n  ✗ The relay turned this agent away (${code}): ${msg}`)
+  const host = new HostController(state, config, runner, sessions, (code, msg) => {
+    console.error(`\n  ✗ The relay turned this host away (${code}): ${msg}`)
     console.error(`  Set "signupCode" in ${join(dir, 'config.json')} to the relay's access code and start again.\n`)
     process.exit(1)
   })
-  const engine = new Engine(peer, runner, config, state)
-  peer.handlers = engine
 
-  console.log(`\n  Claude Remote — “${config.name}”`)
+  console.log(`\n  Carrier · Claude Remote — host “${config.name}”`)
   console.log(`  State: ${dir}`)
   console.log(`  Relay: ${config.relay}   Runner: ${runnerKind}`)
   const projects = Object.keys(config.projects)
   console.log(`  Projects: ${projects.length ? projects.join(', ') : '(none set — edit config.json → projects)'}`)
 
   if (args.has('--code')) {
-    await printPairing(peer, config.relay)
+    await printPairing(host.chatCode(), config.relay)
     process.exit(0)
   }
 
@@ -59,32 +57,29 @@ async function main(): Promise<void> {
   }
 
   if (!state.ownerPk) {
-    await printPairing(peer, config.relay)
+    await printPairing(host.chatCode(), config.relay)
     console.log('  Waiting for your phone to pair…\n')
   } else {
-    console.log(`  Paired (owner ${state.ownerPk.slice(0, 8)}…). Ready.`)
-    console.log('  Re-pair with a different phone:  npm run bridge -- --reset-owner\n')
+    console.log(`  Paired (owner ${state.ownerPk.slice(0, 8)}…) · ${state.agents.length} agent(s). Ready.`)
+    console.log('  Re-pair with a different phone:  npm start -- --reset-owner\n')
   }
 
-  peer.start()
-  engine.start()
+  host.start()
 
   const shutdown = () => {
     console.log('\n  Shutting down — flushing state…')
-    peer.stop()
-    state.flush()
+    host.stop()
     process.exit(0)
   }
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 }
 
-async function printPairing(peer: CarrierPeer, relayUrl: string): Promise<void> {
-  const code = peer.chatCode()
+async function printPairing(code: string, relayUrl: string): Promise<void> {
   const link = `${webOrigin(relayUrl)}/#i=${code}`
-  console.log('\n  ── Pair this agent ─────────────────────────────────────')
-  console.log('  In Carrier: turn on Settings → Claude Remote, open the CC')
-  console.log('  tab → “Set up an agent”, and paste this chat code:\n')
+  console.log('\n  ── Pair this Mac ───────────────────────────────────────')
+  console.log('  In Carrier: Settings → Claude Remote (on), open the CC tab →')
+  console.log('  “Connect a Mac”, and paste this code (or scan the QR):\n')
   console.log(`  ${code}\n`)
   console.log(`  or open on your phone:  ${link}`)
   await printQr(link)

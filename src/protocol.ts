@@ -14,6 +14,10 @@ export const MAX_GROUP_MEMBERS = 10
 export const MAX_AGENT_QUEUE = 20
 /** Most questions one `a-ask` batches (mirrors the SDK's AskUserQuestion cap). */
 export const MAX_AGENT_QUESTIONS = 4
+/** Most agents an `a-host` roster carries. */
+export const MAX_HOST_AGENTS = 24
+/** Most resumable sessions an `a-sessions` list carries. */
+export const MAX_HOST_SESSIONS = 60
 const MAX_FRAME = 65_536
 const FID_BYTES = 16
 const GID_BYTES = 16 // a group id is 16 random bytes (22 b64u chars) — never collides with a 32-byte pk
@@ -28,6 +32,8 @@ export type Inner =
   // `replyTo` = the id of the message this one quotes. Optional + whitelisted,
   // so an old build simply drops it and shows a plain message.
   | { kind: 'msg'; id: string; ts: number; text: string; replyTo?: string }
+  | { kind: 'edit'; id: string; ts: number; text: string } // edit a prior msg's text (ts = edit time)
+  | { kind: 'del'; id: string } // tombstone a prior msg (both sides drop its content)
   | { kind: 'ack'; ids: string[] }
   | { kind: 'read'; ids: string[] }
   | { kind: 'typing'; on: boolean }
@@ -46,6 +52,8 @@ export type Inner =
   // ever sees N unrelated 1:1 sends and never learns a group exists. `sender`
   // is trusted only when it equals the crypto_box-authenticated relay `from`.
   | { kind: 'gmsg'; gid: string; sender: string; id: string; ts: number; text: string; replyTo?: string }
+  | { kind: 'gedit'; gid: string; sender: string; id: string; ts: number; text: string }
+  | { kind: 'gdel'; gid: string; sender: string; id: string }
   | { kind: 'gfile-meta'; gid: string; sender: string; id: string; ts: number; fid: string; name: string; mime: string; size: number; chunks: number }
   | { kind: 'gack'; gid: string; ids: string[] }
   | { kind: 'gread'; gid: string; ids: string[] }
@@ -82,7 +90,8 @@ export type Inner =
   //
   // `a-status` (bridge→owner, volatile like typing): a live snapshot of the
   // agent — current state, model, the model menu, and the task queue.
-  | { kind: 'a-status'; ts: number; state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[] }
+  // `project`/`branch` (optional) name the worktree this agent runs in.
+  | { kind: 'a-status'; ts: number; state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[]; project?: string; branch?: string }
   // `a-ctl` (owner→bridge): switch the model, cancel a task (id or 'all'), or ask
   // for a fresh status. `ts` lets the bridge ignore a mailbox-stale cancel.
   | { kind: 'a-ctl'; ts: number; model?: string; cancel?: string; sync?: true }
@@ -90,6 +99,17 @@ export type Inner =
   // numbered-options `msg` (which carries the push) into tappable option chips.
   // `msgId` ties it to that companion message; the owner answers with a `msg`.
   | { kind: 'a-ask'; ask: string; msgId: string; questions: { q: string; header?: string; multi?: boolean; options: { label: string; desc?: string }[] }[] }
+  // --- Claude Remote host layer (one Mac = a HOST of many agents) --------------
+  // A host advertises caps:['cc','host'] and, over the owner channel, announces
+  // its fleet + projects (`a-host`) and a project's resumable sessions
+  // (`a-sessions`); the owner asks it to spawn/attach (`a-spawn`), close
+  // (`a-close`), or list sessions (`a-list`). Each spawned agent is its own
+  // identity/contact and speaks the ordinary a-status/a-ctl/a-ask/msg protocol.
+  | { kind: 'a-host'; ts: number; agents: { pk: string; name: string; state: string; project?: string; branch?: string }[]; projects: { name: string }[] }
+  | { kind: 'a-sessions'; project: string; sessions: { id: string; title: string; branch?: string; updatedAt: number }[] }
+  | { kind: 'a-spawn'; ts: number; project: string; branch?: string; attach?: string }
+  | { kind: 'a-close'; ts: number; pk: string }
+  | { kind: 'a-list'; project: string }
 
 /** Most inclusive [start, end] ranges one file-req may carry. */
 export const MAX_REQ_RANGES = 256
@@ -157,6 +177,15 @@ function validateInner(raw: unknown): Inner | null {
       }
       const replyTo = isId(o['replyTo']) ? o['replyTo'] : undefined // whitelist; junk is dropped
       return { kind: 'msg', id: o['id'], ts: o['ts'], text: o['text'], ...(replyTo ? { replyTo } : {}) }
+    }
+    case 'edit': {
+      if (!isId(o['id']) || !isTs(o['ts'])) throw new ProtocolError('bad edit')
+      if (typeof o['text'] !== 'string' || o['text'].length === 0 || o['text'].length > MAX_TEXT) throw new ProtocolError('bad edit text')
+      return { kind: 'edit', id: o['id'], ts: o['ts'], text: o['text'] }
+    }
+    case 'del': {
+      if (!isId(o['id'])) throw new ProtocolError('bad del')
+      return { kind: 'del', id: o['id'] }
     }
     case 'ack':
     case 'read': {
@@ -242,6 +271,15 @@ function validateInner(raw: unknown): Inner | null {
       }
       const greplyTo = isId(o['replyTo']) ? o['replyTo'] : undefined
       return { kind: 'gmsg', gid: o['gid'], sender: o['sender'], id: o['id'], ts: o['ts'], text: o['text'], ...(greplyTo ? { replyTo: greplyTo } : {}) }
+    }
+    case 'gedit': {
+      if (!isGid(o['gid']) || !isPk(o['sender']) || !isId(o['id']) || !isTs(o['ts'])) throw new ProtocolError('bad gedit')
+      if (typeof o['text'] !== 'string' || o['text'].length === 0 || o['text'].length > MAX_TEXT) throw new ProtocolError('bad gedit text')
+      return { kind: 'gedit', gid: o['gid'], sender: o['sender'], id: o['id'], ts: o['ts'], text: o['text'] }
+    }
+    case 'gdel': {
+      if (!isGid(o['gid']) || !isPk(o['sender']) || !isId(o['id'])) throw new ProtocolError('bad gdel')
+      return { kind: 'gdel', gid: o['gid'], sender: o['sender'], id: o['id'] }
     }
     case 'gfile-meta': {
       if (!isGid(o['gid']) || !isPk(o['sender']) || !isId(o['id']) || !isTs(o['ts']) || !isFid(o['fid'])) {
@@ -367,7 +405,9 @@ function validateInner(raw: unknown): Inner | null {
         if (typeof q['title'] !== 'string' || q['title'].length > 80) throw new ProtocolError('bad a-status title')
         return { id: q['id'], title: q['title'], state: q['state'] }
       })
-      return { kind: 'a-status', ts: o['ts'], state: o['state'], model: o['model'], models, queue }
+      const sProject = isText(o['project'], 120) ? o['project'] : undefined
+      const sBranch = isText(o['branch'], 120) ? o['branch'] : undefined
+      return { kind: 'a-status', ts: o['ts'], state: o['state'], model: o['model'], models, queue, ...(sProject ? { project: sProject } : {}), ...(sBranch ? { branch: sBranch } : {}) }
     }
     case 'a-ctl': {
       if (!isTs(o['ts'])) throw new ProtocolError('bad a-ctl')
@@ -398,6 +438,52 @@ function validateInner(raw: unknown): Inner | null {
       })
       return { kind: 'a-ask', ask: o['ask'], msgId: o['msgId'], questions }
     }
+    case 'a-host': {
+      if (!isTs(o['ts'])) throw new ProtocolError('bad a-host')
+      const rawAgents = o['agents']
+      if (!Array.isArray(rawAgents) || rawAgents.length > MAX_HOST_AGENTS) throw new ProtocolError('bad a-host agents')
+      const agents = rawAgents.map((e) => {
+        const a = e as Record<string, unknown>
+        if (!isPk(a['pk']) || !isText(a['name'], 64) || !isLoose16(a['state'])) throw new ProtocolError('bad a-host agent')
+        const project = isText(a['project'], 120) ? a['project'] : undefined
+        const branch = isText(a['branch'], 120) ? a['branch'] : undefined
+        return { pk: a['pk'], name: a['name'], state: a['state'], ...(project ? { project } : {}), ...(branch ? { branch } : {}) }
+      })
+      const rawProjects = o['projects']
+      if (!Array.isArray(rawProjects) || rawProjects.length > 64) throw new ProtocolError('bad a-host projects')
+      const projects = rawProjects.map((e) => {
+        const p = e as Record<string, unknown>
+        if (!isText(p['name'], 64)) throw new ProtocolError('bad a-host project')
+        return { name: p['name'] }
+      })
+      return { kind: 'a-host', ts: o['ts'], agents, projects }
+    }
+    case 'a-sessions': {
+      if (!isText(o['project'], 64)) throw new ProtocolError('bad a-sessions')
+      const raw = o['sessions']
+      if (!Array.isArray(raw) || raw.length > MAX_HOST_SESSIONS) throw new ProtocolError('bad a-sessions list')
+      const sessions = raw.map((e) => {
+        const s = e as Record<string, unknown>
+        if (!isText(s['id'], 64) || !isText(s['title'], 120) || !isTs(s['updatedAt'])) throw new ProtocolError('bad a-sessions item')
+        const branch = isText(s['branch'], 120) ? s['branch'] : undefined
+        return { id: s['id'], title: s['title'], updatedAt: s['updatedAt'], ...(branch ? { branch } : {}) }
+      })
+      return { kind: 'a-sessions', project: o['project'], sessions }
+    }
+    case 'a-spawn': {
+      if (!isTs(o['ts']) || !isText(o['project'], 64)) throw new ProtocolError('bad a-spawn')
+      const branch = isText(o['branch'], 120) ? o['branch'] : undefined
+      const attach = isText(o['attach'], 64) ? o['attach'] : undefined
+      return { kind: 'a-spawn', ts: o['ts'], project: o['project'], ...(branch ? { branch } : {}), ...(attach ? { attach } : {}) }
+    }
+    case 'a-close': {
+      if (!isTs(o['ts']) || !isPk(o['pk'])) throw new ProtocolError('bad a-close')
+      return { kind: 'a-close', ts: o['ts'], pk: o['pk'] }
+    }
+    case 'a-list': {
+      if (!isText(o['project'], 64)) throw new ProtocolError('bad a-list')
+      return { kind: 'a-list', project: o['project'] }
+    }
     default:
       return null // unknown kind from a future version: drop silently
   }
@@ -419,6 +505,11 @@ function isLoose16(x: unknown): x is string {
 /** A model alias or full id: 'sonnet', 'opus', 'claude-opus-4-8', … (≤48 chars). */
 function isModelName(x: unknown): x is string {
   return typeof x === 'string' && x.length > 0 && x.length <= 48
+}
+
+/** A non-empty display string within `max` chars (name/project/branch/title/id). */
+function isText(x: unknown, max: number): x is string {
+  return typeof x === 'string' && x.length > 0 && x.length <= max
 }
 
 function isFid(x: unknown): x is string {

@@ -1,6 +1,7 @@
-// Durable bridge state: the identity keypair (identity.json, 0600 — it IS the
-// account), the pinned owner + per-project Claude session ids (state.json), and
-// the task queue (queue.json, so a restart never loses queued work).
+// Durable host state: the host identity keypair (identity.json, 0600 — it IS the
+// account), the pinned owner, and the AGENT REGISTRY (host.json) — each agent is
+// its own keypair + worktree + Claude session + task queue. One host, many
+// agents (Conductor-style).
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -21,10 +22,37 @@ export interface Task {
   title: string
 }
 
-interface PersistedState {
+/** The persistence surface the Engine needs — AgentState satisfies it. */
+export interface EngineState {
+  queue: Task[]
+  session(project: string): string | undefined
+  setSession(project: string, id: string): void
+  clearSession(project: string): void
+  saveQueue(): void
+}
+
+/** One agent in the fleet: its own identity, worktree, Claude session, queue. */
+export interface AgentRecord {
+  id: string
+  /** agent public / private key (b64u) — its own Carrier identity */
+  pk: string
+  sk: string
+  name: string
+  project: string
+  /** absolute working directory (a git worktree, or the project dir for attach) */
+  cwd: string
+  branch?: string
+  /** true if we created a git worktree for it that should be removed on close */
+  worktree?: boolean
+  model: string
+  /** Claude Code session id — from an attach, or captured on first run */
+  sessionId?: string
+  queue: Task[]
+}
+
+interface HostPersisted {
   ownerPk: string | null
-  /** project name → Claude Code session id, for conversational continuity */
-  sessions: Record<string, string>
+  agents: AgentRecord[]
 }
 
 export function taskTitle(text: string): string {
@@ -32,21 +60,17 @@ export function taskTitle(text: string): string {
   return firstLine.length > 80 ? firstLine.slice(0, 79) + '…' : firstLine || '(task)'
 }
 
-export class BridgeState {
+export class HostState {
   readonly identity: Identity
-  queue: Task[]
-  private s: PersistedState
-  private stateStore: JsonStore<PersistedState>
-  private queueStore: JsonStore<Task[]>
+  private s: HostPersisted
+  private store: JsonStore<HostPersisted>
 
   constructor(dir: string) {
     this.identity = loadOrCreateIdentity(dir)
-    this.stateStore = new JsonStore<PersistedState>(dir, 'state.json')
-    this.s = this.stateStore.load({ ownerPk: null, sessions: {} })
-    this.stateStore.bind(() => this.s)
-    this.queueStore = new JsonStore<Task[]>(dir, 'queue.json')
-    this.queue = this.queueStore.load([])
-    this.queueStore.bind(() => this.queue)
+    this.store = new JsonStore<HostPersisted>(dir, 'host.json')
+    this.s = this.store.load({ ownerPk: null, agents: [] })
+    for (const a of this.s.agents) if (!a.queue) a.queue = []
+    this.store.bind(() => this.s)
   }
 
   get ownerPk(): string | null {
@@ -54,39 +78,69 @@ export class BridgeState {
   }
   setOwner(pk: string): void {
     this.s.ownerPk = pk
-    this.stateStore.flushSync()
+    this.store.flushSync()
   }
   clearOwner(): void {
     this.s.ownerPk = null
-    this.s.sessions = {}
-    this.stateStore.flushSync()
-    // Drop the queue too — a newly paired owner must not inherit the previous
-    // owner's pending tasks.
-    this.queue = []
-    this.saveQueue()
+    this.s.agents = [] // a newly paired owner starts with an empty fleet
+    this.store.flushSync()
   }
 
-  session(project: string): string | undefined {
-    return this.s.sessions[project]
+  get agents(): AgentRecord[] {
+    return this.s.agents
   }
-  setSession(project: string, id: string): void {
-    this.s.sessions[project] = id
-    this.stateStore.markDirty()
+  addAgent(a: AgentRecord): void {
+    this.s.agents.push(a)
+    this.store.flushSync()
   }
-  clearSession(project: string): void {
-    delete this.s.sessions[project]
-    this.stateStore.markDirty()
+  removeAgent(pk: string): void {
+    this.s.agents = this.s.agents.filter((a) => a.pk !== pk)
+    this.store.flushSync()
   }
 
-  /** Persist the queue NOW (before we tell the relay we took custody). */
+  save(): void {
+    this.store.flushSync()
+  }
+  markDirty(): void {
+    this.store.markDirty()
+  }
+}
+
+/** EngineState over one AgentRecord, persisting through the host store. */
+export class AgentState implements EngineState {
+  constructor(
+    private rec: AgentRecord,
+    private host: HostState,
+  ) {
+    if (!rec.queue) rec.queue = []
+  }
+  get queue(): Task[] {
+    return this.rec.queue
+  }
+  set queue(q: Task[]) {
+    this.rec.queue = q
+  }
+  session(_project: string): string | undefined {
+    return this.rec.sessionId
+  }
+  setSession(_project: string, id: string): void {
+    this.rec.sessionId = id
+    this.host.markDirty()
+  }
+  clearSession(_project: string): void {
+    this.rec.sessionId = undefined
+    this.host.markDirty()
+  }
   saveQueue(): void {
-    this.queueStore.flushSync()
+    this.host.save()
   }
+}
 
-  flush(): void {
-    this.stateStore.flushSync()
-    this.queueStore.flushSync()
-  }
+/** Derive the coarse agent state (idle|busy|waiting) for the roster from a queue. */
+export function agentState(queue: Task[]): string {
+  if (queue.some((t) => t.state === 'waiting')) return 'waiting'
+  if (queue.some((t) => t.state === 'running' || t.state === 'queued')) return 'busy'
+  return 'idle'
 }
 
 function loadOrCreateIdentity(dir: string): Identity {

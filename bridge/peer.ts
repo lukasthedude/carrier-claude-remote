@@ -1,49 +1,65 @@
-// The Carrier-protocol layer: turns the relay's opaque frames into decrypted
-// inner messages and back, pins the owner (the first phone to pair), drops
-// everyone else, and exposes the send verbs the engine needs (chunked replies,
-// receipts, typing, agent status/questions). No task logic lives here.
+// The Carrier-protocol layer: one Carrier identity + relay socket. Decodes
+// owner frames → handler callbacks, encodes replies. Generic enough to power
+// BOTH a task agent (caps:['cc'], owner preset by the host) and the host control
+// channel (caps:['cc','host'], pins its own owner, speaks a-host/a-spawn/…).
 
 import { formatSafetyNumber, fromB64u, randomBytes, safetyNumber, toB64u, utf8Encode, type Identity } from '../src/crypto'
 import { decodeFrame, encodeFrame, type Inner } from '../src/protocol'
 import { chunkText } from './chunk'
 import { BridgeRelay } from './relay'
-import type { BridgeConfig } from './config'
 import type { AskQuestion } from './runner'
-import type { BridgeState } from './state'
 
-// One canonical question shape, shared with the runner (which produces it) so
-// the two can't silently diverge.
+// One canonical question shape, shared with the runner (which produces it).
 export type AgentQuestion = AskQuestion
 
+export interface PeerOpts {
+  identity: Identity
+  name: string
+  relay: string
+  signupCode: string
+  private: boolean
+  /** hello caps: ['cc'] for an agent, ['cc','host'] for the host. */
+  caps?: string[]
+  /** preset for agents (the host's owner); null ⇒ this peer pins its own owner. */
+  ownerPk?: string | null
+  /** shown in the agent's a-status (which worktree it runs in). */
+  project?: string
+  branch?: string
+  /** the host persists the owner it pins here. */
+  onOwnerPin?: (pk: string) => void
+  onSignupGate: (code: string, msg: string) => void
+  /** agents run silent; only the host narrates to the console. */
+  quiet?: boolean
+}
+
 export interface PeerHandlers {
-  /** the owner sent a line (a task or a command or an answer) */
-  onOwnerMessage(text: string, msgId: string): void
-  /** the owner sent an a-ctl (model switch / cancel / status request); `ts` is
-   *  the send time, so the engine can ignore a mailbox-stale cancel */
-  onCtl(ctl: { model?: string; cancel?: string; sync?: true; ts: number }): void
-  /** the owner's phone (re)connected — re-announce + emit a fresh status */
-  onOwnerConnected(): void
+  // agent role
+  onOwnerMessage?(text: string, msgId: string): void
+  onCtl?(ctl: { model?: string; cancel?: string; sync?: true; ts: number }): void
+  onOwnerConnected?(): void
+  // host role
+  onSpawn?(spawn: { project: string; branch?: string; attach?: string }): void
+  onClose?(pk: string): void
+  onList?(project: string): void
 }
 
 export class CarrierPeer {
   handlers: PeerHandlers | null = null
+  readonly myPk: string
   private relay: BridgeRelay
   private identity: Identity
-  readonly myPk: string
+  private ownerPk: string | null
 
-  constructor(
-    private state: BridgeState,
-    private config: BridgeConfig,
-    private onSignupGate: (code: string, msg: string) => void,
-  ) {
-    this.identity = state.identity
+  constructor(private opts: PeerOpts) {
+    this.identity = opts.identity
     this.myPk = toB64u(this.identity.publicKey)
-    this.relay = new BridgeRelay(config.relay, this.identity, config.signupCode, config.private, {
+    this.ownerPk = opts.ownerPk ?? null
+    this.relay = new BridgeRelay(opts.relay, this.identity, opts.signupCode, opts.private, {
       onReady: () => this.onReady(),
       onFrame: (from, data) => this.onFrame(from, data),
       onSent: () => {},
-      onSignupGate: (code, msg) => this.onSignupGate(code, msg),
-      onConnectionChange: (c) => console.log(c ? '[relay] connected' : '[relay] disconnected — reconnecting…'),
+      onSignupGate: (code, msg) => opts.onSignupGate(code, msg),
+      onConnectionChange: (c) => { if (!opts.quiet) console.log(c ? '[relay] connected' : '[relay] disconnected — reconnecting…') },
     })
   }
 
@@ -53,21 +69,23 @@ export class CarrierPeer {
   stop(): void {
     this.relay.stop()
   }
+  get owner(): string | null {
+    return this.ownerPk
+  }
 
   /** `${pk}.${b64u(name)}` — paste this into Carrier's "Add a friend". */
   chatCode(): string {
-    return `${this.myPk}.${toB64u(utf8Encode(this.config.name))}`
+    return `${this.myPk}.${toB64u(utf8Encode(this.opts.name))}`
   }
 
   private hello(): Inner {
-    return { kind: 'hello', name: this.config.name, pk: this.myPk, caps: ['cc'] }
+    return { kind: 'hello', name: this.opts.name, pk: this.myPk, caps: this.opts.caps ?? ['cc'] }
   }
 
   private onReady(): void {
-    const owner = this.state.ownerPk
-    if (owner) {
-      this.sendInner(owner, this.hello()) // remind the phone who we are + our caps
-      this.handlers?.onOwnerConnected()
+    if (this.ownerPk) {
+      this.sendInner(this.ownerPk, this.hello()) // remind the phone who we are + our caps
+      this.handlers?.onOwnerConnected?.()
     }
   }
 
@@ -80,91 +98,110 @@ export class CarrierPeer {
     }
     if (!inner) return
 
-    const owner = this.state.ownerPk
-    if (!owner) {
-      // Unpaired: the first genuine 1:1 hello becomes the owner, forever.
+    if (!this.ownerPk) {
+      // Unpaired (host only): the first genuine 1:1 hello becomes the owner.
       if (inner.kind === 'hello' && !inner.gid) {
-        this.state.setOwner(from)
+        this.ownerPk = from
+        this.opts.onOwnerPin?.(from)
         this.sendInner(from, this.hello())
-        this.printSafety(from)
-        this.handlers?.onOwnerConnected()
+        if (!this.opts.quiet) this.printSafety(from)
+        this.handlers?.onOwnerConnected?.()
       }
       return
     }
-    if (from !== owner) return // pinned — ignore every other sender, silently
+    if (from !== this.ownerPk) return // pinned — ignore every other sender
 
     switch (inner.kind) {
       case 'hello':
         this.sendInner(from, this.hello())
-        this.handlers?.onOwnerConnected()
+        this.handlers?.onOwnerConnected?.()
         return
       case 'msg':
-        this.sendAck([inner.id]) // phone shows "Delivered" immediately
-        this.handlers?.onOwnerMessage(inner.text, inner.id)
+        this.sendAck([inner.id])
+        this.handlers?.onOwnerMessage?.(inner.text, inner.id)
         return
       case 'a-ctl':
-        this.handlers?.onCtl({
+        this.handlers?.onCtl?.({
           ts: inner.ts,
           ...(inner.model ? { model: inner.model } : {}),
           ...(inner.cancel ? { cancel: inner.cancel } : {}),
           ...(inner.sync ? { sync: true } : {}),
         })
         return
+      case 'a-spawn':
+        this.handlers?.onSpawn?.({ project: inner.project, ...(inner.branch ? { branch: inner.branch } : {}), ...(inner.attach ? { attach: inner.attach } : {}) })
+        return
+      case 'a-close':
+        this.handlers?.onClose?.(inner.pk)
+        return
+      case 'a-list':
+        this.handlers?.onList?.(inner.project)
+        return
       default:
-        return // ack/read/typing/file/call/group — nothing to do
+        return
     }
   }
 
-  // ---- send verbs (engine calls these; owner is resolved internally) ----
+  // ---- send verbs (owner resolved internally) ----
 
   /** Send text to the owner, chunked to fit MAX_TEXT. Returns the first msg id. */
   sendText(text: string): string {
-    const owner = this.state.ownerPk
-    if (!owner || !text.trim()) return ''
+    if (!this.ownerPk || !text.trim()) return ''
     let firstId = ''
     let ts = Date.now()
     for (const chunk of chunkText(text)) {
       if (!chunk) continue
       const id = toB64u(randomBytes(8))
       if (!firstId) firstId = id
-      this.sendInner(owner, { kind: 'msg', id, ts, text: chunk })
-      ts += 1 // strictly increasing so chunks stay ordered on the phone
+      this.sendInner(this.ownerPk, { kind: 'msg', id, ts, text: chunk })
+      ts += 1
     }
     return firstId
   }
 
   sendStatus(status: { state: string; model: string; models: string[]; queue: { id: string; title: string; state: string }[] }): void {
-    const owner = this.state.ownerPk
-    if (!owner) return
-    this.sendInner(owner, { kind: 'a-status', ts: Date.now(), ...status })
+    if (!this.ownerPk) return
+    this.sendInner(this.ownerPk, {
+      kind: 'a-status',
+      ts: Date.now(),
+      ...status,
+      ...(this.opts.project ? { project: this.opts.project } : {}),
+      ...(this.opts.branch ? { branch: this.opts.branch } : {}),
+    })
   }
 
   sendAsk(ask: string, msgId: string, questions: AgentQuestion[]): void {
-    const owner = this.state.ownerPk
-    if (!owner) return
-    // Clamp to the protocol's a-ask limits so a long question can never make the
-    // phone's validateInner throw and drop the whole (chips) frame — the full
-    // text still rides the companion msg. Must have ≥2 options to stay valid.
+    if (!this.ownerPk) return
     const clamped: AgentQuestion[] = questions.slice(0, 4).map((q) => ({
       q: q.q.slice(0, 500),
       ...(q.header ? { header: q.header.slice(0, 16) } : {}),
       ...(q.multi ? { multi: true as const } : {}),
       options: q.options.slice(0, 8).map((o) => ({ label: o.label.slice(0, 120), ...(o.desc ? { desc: o.desc.slice(0, 250) } : {}) })),
     }))
-    if (clamped.some((q) => q.options.length < 2)) return // no tappable chips — the companion msg covers it
-    this.sendInner(owner, { kind: 'a-ask', ask, msgId, questions: clamped })
+    if (clamped.some((q) => q.options.length < 2)) return
+    this.sendInner(this.ownerPk, { kind: 'a-ask', ask, msgId, questions: clamped })
   }
 
   sendTyping(on: boolean): void {
-    const owner = this.state.ownerPk
-    if (!owner) return
-    this.sendInner(owner, { kind: 'typing', on })
+    if (!this.ownerPk) return
+    this.sendInner(this.ownerPk, { kind: 'typing', on })
   }
 
   sendAck(ids: string[]): void {
-    const owner = this.state.ownerPk
-    if (!owner) return
-    this.sendInner(owner, { kind: 'ack', ids })
+    if (!this.ownerPk) return
+    this.sendInner(this.ownerPk, { kind: 'ack', ids })
+  }
+
+  // ---- host-only send verbs ----
+
+  sendHostRoster(agents: { pk: string; name: string; state: string; project?: string; branch?: string }[], projects: { name: string }[]): void {
+    if (!this.ownerPk) return
+    this.sendInner(this.ownerPk, { kind: 'a-host', ts: Date.now(), agents, projects })
+  }
+
+  sendSessions(project: string, sessions: { id: string; title: string; branch?: string; updatedAt: number }[]): void {
+    if (!this.ownerPk) return
+    this.sendInner(this.ownerPk, { kind: 'a-sessions', project, sessions })
   }
 
   private sendInner(to: string, inner: Inner): void {
@@ -172,10 +209,11 @@ export class CarrierPeer {
     try {
       frame = encodeFrame(inner, fromB64u(to), this.identity.privateKey)
     } catch {
-      return // bad key
+      return
     }
-    const push = inner.kind === 'msg' // only real messages wake the phone
-    const store = inner.kind !== 'typing' && inner.kind !== 'a-status' // volatile ones aren't mailboxed
+    const push = inner.kind === 'msg'
+    // volatile presence (a-status/a-host) isn't mailboxed; everything else is.
+    const store = inner.kind !== 'typing' && inner.kind !== 'a-status' && inner.kind !== 'a-host'
     const id = inner.kind === 'msg' ? inner.id : undefined
     this.relay.send(to, frame, { push, store, ...(id ? { id } : {}) })
   }
@@ -184,8 +222,8 @@ export class CarrierPeer {
     const [a, b] = formatSafetyNumber(safetyNumber(this.identity.publicKey, fromB64u(ownerPk)))
     console.log(
       `\n  ✓ Paired with your phone.\n` +
-        `  Verify these digits match the ones under the agent on your phone\n` +
-        `  (open the chat → ⋯ → Verify safety number):\n\n` +
+        `  Verify these digits match the ones under the host on your phone\n` +
+        `  (open it → ⋯ → Verify safety number):\n\n` +
         `    ${a}\n    ${b}\n`,
     )
   }
