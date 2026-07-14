@@ -42,6 +42,12 @@ export interface BridgeConfig {
   private: boolean
   /** 'sdk' = drive Claude Code; 'fake' = deterministic stub (tests) */
   runner: 'sdk' | 'fake'
+  /** Conductor integration (macOS): when a project's repo is a Conductor repo,
+   *  create agent worktrees in Conductor's own layout and register them so they
+   *  show up in the Conductor desktop app. undefined/true = auto (on when a
+   *  Conductor install is detected); false = always use a plain sibling worktree.
+   *  Best-effort: any failure falls back to a sibling worktree, never blocks. */
+  conductor?: boolean
 }
 
 const DEFAULTS: BridgeConfig = {
