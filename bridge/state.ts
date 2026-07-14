@@ -55,6 +55,9 @@ export interface AgentRecord {
   histSent?: boolean
   /** archived (Conductor-style): stopped, worktree removed, record kept */
   archived?: boolean
+  /** Conductor workspace id this agent MIRRORS (created by the desktop app);
+   *  the workspace is the source of truth — close degrades to archive. */
+  conductorWs?: string
   /** permission mode override ('default'|'plan'|…); unset = config default */
   mode?: string
   /** reasoning effort ('low'…'max'); unset = the SDK's model default */

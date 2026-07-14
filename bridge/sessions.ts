@@ -65,8 +65,21 @@ export interface HistEntry {
   ts: number
 }
 
+/** One Conductor workspace (the desktop app's sidebar unit). */
+export interface ConductorWorkspace {
+  id: string
+  /** the sidebar name (user-set), or null when Conductor derives one */
+  name: string | null
+  path: string
+  branch?: string
+  sessionId?: string
+  archived: boolean
+}
+
 export interface SessionManager {
   listSessions(spec: ProjectSpec): Promise<SessionInfo[]>
+  /** The project's Conductor workspaces (all states) — [] off-Conductor. */
+  listWorkspaces(spec: ProjectSpec): Promise<ConductorWorkspace[]>
   getSession(id: string, spec: ProjectSpec): Promise<SessionInfo | undefined>
   /** The recent human-readable transcript of a session (for the phone backfill). */
   getSessionHistory(id: string, spec: ProjectSpec): Promise<HistEntry[]>
@@ -146,6 +159,32 @@ export class SdkSessions implements SessionManager {
       return tail
     } catch (e) {
       console.error(`[sessions] history failed: ${(e as Error).message}`)
+      return []
+    }
+  }
+
+  async listWorkspaces(spec: ProjectSpec): Promise<ConductorWorkspace[]> {
+    const cond = await this.conductorRepo(spec.repo)
+    if (!cond) return []
+    try {
+      const { stdout } = await exec(
+        'sqlite3',
+        ['-json', this.dbPath, `SELECT id, workspace_name, workspace_path, branch, state, active_session_id FROM workspaces WHERE repository_id=${sqlStr(cond.id)};`],
+        { timeout: 8_000 },
+      )
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rows: any[] = JSON.parse(stdout || '[]')
+      return rows
+        .filter((r) => typeof r.workspace_path === 'string' && r.workspace_path)
+        .map((r) => ({
+          id: String(r.id),
+          name: r.workspace_name ? String(r.workspace_name) : null,
+          path: String(r.workspace_path),
+          ...(r.branch ? { branch: String(r.branch) } : {}),
+          ...(r.active_session_id ? { sessionId: String(r.active_session_id) } : {}),
+          archived: r.state === 'archived',
+        }))
+    } catch {
       return []
     }
   }
@@ -239,6 +278,11 @@ export class FakeSessions implements SessionManager {
   }
   async getSession(id: string, spec: ProjectSpec): Promise<SessionInfo | undefined> {
     return (await this.listSessions(spec)).find((s) => s.id === id)
+  }
+  /** Mutable for tests: a mirrored workspace named 'Fake WS' by default. */
+  workspaces: ConductorWorkspace[] = [{ id: 'ws-1', name: 'Fake WS', path: mkdtempSync(join(tmpdir(), 'cc-ws-')), branch: 'feat/fake', archived: false }]
+  async listWorkspaces(_spec: ProjectSpec): Promise<ConductorWorkspace[]> {
+    return this.workspaces
   }
   async getSessionHistory(id: string, _spec: ProjectSpec): Promise<HistEntry[]> {
     if (id !== 'sess-live') return []

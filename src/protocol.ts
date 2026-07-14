@@ -88,6 +88,7 @@ export type Inner =
   // (re-sent every 2s for the ring window); real SDP/ICE ride `call-sig` after
   // the callee accepts, so a declined ring discloses zero network info.
   | { kind: 'call-offer'; call: string; mode: 'audio' | 'video' }
+  | { kind: 'call-ring'; call: string } // callee's device is ringing (offer ack) — caller shows "Ringing…"
   | { kind: 'call-accept'; call: string }
   | { kind: 'call-sig'; call: string; sig: string } // JSON RtcSignal {t:'sdp'|'ice', ...}
   | { kind: 'call-end'; call: string; reason: string } // hangup | decline | busy | cancel (loose)
@@ -440,6 +441,10 @@ function validateInner(raw: unknown): Inner | null {
     case 'call-offer': {
       if (!isId(o['call']) || (o['mode'] !== 'audio' && o['mode'] !== 'video')) throw new ProtocolError('bad call-offer')
       return { kind: 'call-offer', call: o['call'], mode: o['mode'] }
+    }
+    case 'call-ring': {
+      if (!isId(o['call'])) throw new ProtocolError('bad call-ring')
+      return { kind: 'call-ring', call: o['call'] }
     }
     case 'call-accept': {
       if (!isId(o['call'])) throw new ProtocolError('bad call-accept')
